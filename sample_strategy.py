@@ -40,3 +40,17 @@ class Trader:
                 orders[ticker] = -current_pos
 
         return orders
+
+if __name__ == "__main__":
+    import argparse
+    from backtester import Backtester, print_backtest_results
+
+    parser = argparse.ArgumentParser(description="Run the sample strategy backtest")
+    parser.add_argument("--start", default="2024-01-01", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", default="2025-01-01", help="End date (YYYY-MM-DD)")
+    args = parser.parse_args()
+
+    trader = Trader()
+    print(f"Running {trader.name} from {args.start} to {args.end}...")
+    results = Backtester().run(trader, args.start, args.end)
+    print_backtest_results(results)

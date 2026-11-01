@@ -21,7 +21,7 @@ class Backtester:
     def __init__(
         self,
         initial_cash: float = 100_000.0,
-        commission_bps: float = 5.0,
+        commission_bps: float = 10.0,
         risk_free_rate: float = 0.04,
         benchmark_ticker: str = "SPY",
         anonymize: bool = True,       # Scrubs calendar dates & rebases prices to 100
@@ -217,3 +217,27 @@ def load_trader_from_file(filepath: str):
     if not hasattr(module, "Trader"):
         raise AttributeError("Uploaded script must define a `Trader` class.")
     return module.Trader()
+
+
+def print_backtest_results(results):
+    print("\n--- Backtest Results ---")
+    print(f"Annualized Sharpe Ratio : {results['sharpe']:.3f}")
+    print(f"Total Return            : {results['total_return_pct']:.2f}%")
+    print(f"Max Drawdown            : {results['max_drawdown_pct']:.2f}%")
+    print(f"Final Portfolio Equity  : ${results['final_equity']:,.2f}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Quant Club Local Backtester CLI")
+    parser.add_argument("strategy_file", help="Path to your Python strategy file (e.g., sample_strategy.py)")
+    parser.add_argument("--start", default="2024-01-01", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", default="2025-01-01", help="End date (YYYY-MM-DD)")
+    args = parser.parse_args()
+
+    print(f"Loading strategy from {args.strategy_file}...")
+    trader_instance = load_trader_from_file(args.strategy_file)
+    bt = Backtester()
+    print(f"Running backtest from {args.start} to {args.end} on tickers: {trader_instance.tickers}...")
+    results = bt.run(trader_instance, args.start, args.end)
+
+    print_backtest_results(results)

@@ -154,7 +154,7 @@ tab_leaderboard, tab_sandbox, tab_submit, tab_docs, tab_admin = st.tabs(
 # --- TAB 1: LEADERBOARD ---
 with tab_leaderboard:
     st.subheader("Official Out-Of-Sample Rankings")
-    st.caption("Evaluated across undisclosed multi-regime market windows | Ranked by Mean Annualized Sharpe Ratio (5 bps fee/slippage, 4% RF rate)")
+    st.caption("Evaluated across undisclosed multi-regime market windows | Ranked by Mean Annualized Sharpe Ratio (10 bps fee/slippage, 4% RF rate)")
 
     # Pinned SPY Benchmark Reference Bar
     try:
@@ -354,10 +354,19 @@ with tab_docs:
         )
 
     st.markdown("""
+    ### Available Python libraries
+    Uploaded strategies can use the packages installed from `requirements.txt`:
+    - `numpy` and `pandas` for numerical work, time series, and data manipulation.
+    - `scipy` for statistics, optimization, signal processing, and distributions.
+    - `statsmodels` for regressions, statistical tests, and time-series models.
+    - `scikit-learn` for preprocessing, clustering, and lightweight predictive models.
+    - `numba` for accelerating numerical loops with `@numba.njit`.
+    - `yfinance` for market data used by the backtester.
+
     ### Rules for Fair Comparison
     1. **Zero Lookahead Bias:** Your `Trader.run(state)` method is called sequentially day-by-day. `state.history[ticker]` contains OHLCV bars strictly up to current bar $t$.
-    2. **Execution at Next Open:** Orders returned at bar $t$ are filled at the **Open price of bar $t+1$** with **5 bps (0.05%)** slippage/commission deducted.
-    3. **SPY Benchmark:** `SPY` Buy-and-Hold is initialized with $100,000 at the first day's Open (less the 5 bps fee) and held through the end of the evaluation window.
+    2. **Execution at Next Open:** Orders returned at bar $t$ are filled at the **Open price of bar $t+1$** with **10 bps (0.10%)** slippage/commission deducted.
+    3. **SPY Benchmark:** `SPY` Buy-and-Hold is initialized with $100,000 at the first day's Open (less the 10 bps fee) and held through the end of the evaluation window.
     4. **Ranking Metric:** Annualized Daily Sharpe Ratio ($R_f = 4\\%$, $\\sqrt{252}$ scaling) over the official Out-Of-Sample date window, alongside CAPM Alpha ($\\alpha$) and Beta ($\\beta$) relative to `SPY`.
     """)
     st.code(sample_code, language="python")

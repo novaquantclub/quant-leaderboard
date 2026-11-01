@@ -2,3 +2,9 @@ streamlit
 yfinance
 pandas
 numpy
+scipy
+statsmodels
+scikit-learn
+numba
+matplotlib
+seaborn
