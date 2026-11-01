@@ -14,7 +14,7 @@ class TradingState:
     positions: Dict[str, float]       # Current units held per ticker
     cash: float
     portfolio_value: float
-    traderData: str = ""              # Persistent string state from previous bar
+    trader_data: str = ""              # Persistent string state from previous bar
 
 
 class Backtester:
@@ -136,14 +136,14 @@ class Backtester:
                 positions=positions.copy(),
                 cash=cash,
                 portfolio_value=port_val,
-                traderData=trader_data,
+                trader_data=trader_data,
             )
 
             result = trader.run(state)
             if isinstance(result, tuple) and len(result) == 2:
                 orders, new_td = result
                 if not isinstance(new_td, str) or len(new_td) > 100_000:
-                    raise ValueError("traderData must be a string under 100 KB.")
+                    raise ValueError("trader_data must be a string under 100 KB.")
                 trader_data = new_td
             else:
                 orders = result

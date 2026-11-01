@@ -141,18 +141,25 @@ init_db()
 st.set_page_config(page_title="Quant Club Prosperity Leaderboard", layout="wide")
 st.title("🏛️ Nova Quant Club — Strategy Leaderboard & Backtester")
 
-tab_leaderboard, tab_sandbox, tab_submit, tab_docs, tab_admin = st.tabs(
-    [
-        "🏆 Leaderboard",
-        "🧪 Backtester",
-        "🚀 Submit to Leaderboard",
-        "📖 Guide",
-        "🔒 Admin",
-    ]
+sections = [
+    "🏆 Leaderboard",
+    "🧪 Backtester",
+    "🚀 Submit to Leaderboard",
+    "📖 Guide",
+    "🔒 Admin",
+]
+if st.session_state.pop("redirect_to_leaderboard", False):
+    st.session_state["section_selector"] = "🏆 Leaderboard"
+active_section = st.radio(
+    "Section",
+    sections,
+    horizontal=True,
+    label_visibility="collapsed",
+    key="section_selector",
 )
 
 # --- TAB 1: LEADERBOARD ---
-with tab_leaderboard:
+if active_section == "🏆 Leaderboard":
     st.subheader("Official Out-Of-Sample Rankings")
     st.caption("Evaluated across undisclosed multi-regime market windows | Ranked by Mean Annualized Sharpe Ratio (10 bps fee/slippage, 4% RF rate)")
 
@@ -176,7 +183,7 @@ with tab_leaderboard:
         st.dataframe(lb_df, width='stretch')
 
 # --- TAB 2: WEB SANDBOX BACKTESTER ---
-with tab_sandbox:
+if active_section == "🧪 Backtester":
     st.subheader("Interactive In-Sample Web Backtester (vs. SPY Buy & Hold)")
     st.write(
         "Test your `.py` strategy file on historical In-Sample dates and compare your equity curve directly against `SPY`."
@@ -244,7 +251,7 @@ with tab_sandbox:
                 st.error(f"Backtest Error: {e}")
 
 # --- TAB 3: OFFICIAL SUBMISSION ---
-with tab_submit:
+if active_section == "🚀 Submit to Leaderboard":
     st.subheader("Submit Strategy for Official OOS Evaluation")
     st.caption(
         f"Strategies are evaluated across multiple undisclosed historical market regimes "
@@ -319,6 +326,8 @@ with tab_submit:
                                 f"Mean Alpha: **{res['alpha_pct']:+.2f}%** | "
                                 f"Mean Beta: **{res['beta']:.2f}**"
                             )
+                            st.session_state["redirect_to_leaderboard"] = True
+                            st.rerun()
                 except Exception as e:
                     if saved_path and os.path.exists(saved_path) and not row:
                         os.remove(saved_path)
@@ -326,11 +335,8 @@ with tab_submit:
                 finally:
                     if tmp_path and os.path.exists(tmp_path):
                         os.remove(tmp_path)
-                st.rerun()  # Refresh leaderboard after submission
-                
-
 # --- TAB 4: LOCAL SDK & RULES ---
-with tab_docs:
+if active_section == "📖 Guide":
     st.subheader("Download Local Backtester & Strategy Template")
     st.write(
         "Develop locally using the exact same execution engine and SPY benchmark comparison running on this server."
@@ -371,7 +377,7 @@ with tab_docs:
     """)
     st.code(sample_code, language="python")
 
-with tab_admin:
+if active_section == "🔒 Admin":
     st.subheader("Organizer Administration")
     admin_pw = st.text_input("Admin Password", type="password", key="admin_password")
 
