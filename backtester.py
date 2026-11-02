@@ -9,12 +9,12 @@ import yfinance as yf
 
 @dataclass
 class TradingState:
-    step: int                         # Anonymized integer bar index (0, 1, 2, ...)
+    step: int  # Anonymized integer bar index (0, 1, 2, ...)
     history: Dict[str, pd.DataFrame]  # Indexed 0..step, prices normalized to base 100.0
-    positions: Dict[str, float]       # Current units held per ticker
+    positions: Dict[str, float]  # Current units held per ticker
     cash: float
     portfolio_value: float
-    trader_data: str = ""              # Persistent string state from previous bar
+    trader_data: str = ""  # Persistent string state from previous bar
 
 
 class Backtester:
@@ -24,7 +24,7 @@ class Backtester:
         commission_bps: float = 10.0,
         risk_free_rate: float = 0.04,
         benchmark_ticker: str = "SPY",
-        anonymize: bool = True,       # Scrubs calendar dates & rebases prices to 100
+        anonymize: bool = True,  # Scrubs calendar dates & rebases prices to 100
     ):
         self.initial_cash = initial_cash
         self.commission_rate = commission_bps / 10_000.0
@@ -32,19 +32,30 @@ class Backtester:
         self.benchmark_ticker = benchmark_ticker
         self.anonymize = anonymize
 
-    def _download_single(self, ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+    def _download_single(
+        self, ticker: str, start_date: str, end_date: str
+    ) -> pd.DataFrame:
         t_clean = ticker.strip().upper()
-        df = yf.download(t_clean, start=start_date, end=end_date, auto_adjust=True, progress=False)
+        df = yf.download(
+            t_clean, start=start_date, end=end_date, auto_adjust=True, progress=False
+        )
         if df.empty:
             raise ValueError(f"No data returned from yfinance for '{t_clean}'.")
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
 
-    def fetch_data(self, tickers: List[str], start_date: str, end_date: str) -> Dict[str, pd.DataFrame]:
+    def fetch_data(
+        self, tickers: List[str], start_date: str, end_date: str
+    ) -> Dict[str, pd.DataFrame]:
         if not tickers or len(tickers) > 20:
-            raise ValueError("Strategy must declare between 1 and 20 valid yfinance tickers.")
-        return {t.strip().upper(): self._download_single(t, start_date, end_date) for t in tickers}
+            raise ValueError(
+                "Strategy must declare between 1 and 20 valid yfinance tickers."
+            )
+        return {
+            t.strip().upper(): self._download_single(t, start_date, end_date)
+            for t in tickers
+        }
 
     def _calc_metrics(self, equity_series: pd.Series) -> Dict[str, float]:
         returns = equity_series.pct_change().fillna(0.0)
@@ -113,7 +124,7 @@ class Backtester:
 
                 trade_val = qty * open_price
                 fee = abs(trade_val) * self.commission_rate
-                cash -= (trade_val + fee)
+                cash -= trade_val + fee
                 positions[t] += qty
 
             pending_orders = {}
@@ -149,12 +160,18 @@ class Backtester:
                 orders = result
 
             if isinstance(orders, dict):
-                pending_orders = {str(k).upper(): float(v) for k, v in orders.items() if str(k).upper() in tickers}
+                pending_orders = {
+                    str(k).upper(): float(v)
+                    for k, v in orders.items()
+                    if str(k).upper() in tickers
+                }
 
         eq_df = pd.DataFrame(equity_curve).set_index("Date")
 
         spy_aligned = spy_df["Close"].reindex(eq_df.index).ffill().bfill()
-        spy_first_open = float(spy_df["Open"].reindex(eq_df.index).ffill().bfill().iloc[0])
+        spy_first_open = float(
+            spy_df["Open"].reindex(eq_df.index).ffill().bfill().iloc[0]
+        )
         spy_shares = self.initial_cash / (spy_first_open * (1.0 + self.commission_rate))
         eq_df["SPY_Benchmark"] = spy_shares * spy_aligned
 
@@ -164,7 +181,9 @@ class Backtester:
         cov_matrix = np.cov(strat_m["excess_returns"], spy_m["excess_returns"])
         spy_var = cov_matrix[1, 1]
         beta = float(cov_matrix[0, 1] / spy_var) if spy_var > 1e-12 else 0.0
-        daily_alpha = strat_m["excess_returns"].mean() - beta * spy_m["excess_returns"].mean()
+        daily_alpha = (
+            strat_m["excess_returns"].mean() - beta * spy_m["excess_returns"].mean()
+        )
         alpha_annual_pct = float(daily_alpha * 252 * 100.0)
 
         return {
@@ -201,7 +220,9 @@ class Backtester:
             "sharpe": float(np.mean(sharpes)),
             "min_regime_sharpe": float(np.min(sharpes)),
             "spy_sharpe": float(np.mean(spy_sharpes)),
-            "total_return_pct": float(np.mean([r["total_return_pct"] for r in results])),
+            "total_return_pct": float(
+                np.mean([r["total_return_pct"] for r in results])
+            ),
             "max_drawdown_pct": float(np.min([r["max_drawdown_pct"] for r in results])),
             "alpha_pct": float(np.mean([r["alpha_pct"] for r in results])),
             "beta": float(np.mean([r["beta"] for r in results])),
@@ -229,7 +250,10 @@ def print_backtest_results(results):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Quant Club Local Backtester CLI")
-    parser.add_argument("strategy_file", help="Path to your Python strategy file (e.g., sample_strategy.py)")
+    parser.add_argument(
+        "strategy_file",
+        help="Path to your Python strategy file (e.g., sample_strategy.py)",
+    )
     parser.add_argument("--start", default="2024-01-01", help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", default="2025-01-01", help="End date (YYYY-MM-DD)")
     args = parser.parse_args()
@@ -237,7 +261,9 @@ if __name__ == "__main__":
     print(f"Loading strategy from {args.strategy_file}...")
     trader_instance = load_trader_from_file(args.strategy_file)
     bt = Backtester()
-    print(f"Running backtest from {args.start} to {args.end} on tickers: {trader_instance.tickers}...")
+    print(
+        f"Running backtest from {args.start} to {args.end} on tickers: {trader_instance.tickers}..."
+    )
     results = bt.run(trader_instance, args.start, args.end)
 
     print_backtest_results(results)

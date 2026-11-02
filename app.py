@@ -7,12 +7,12 @@ import pandas as pd
 from backtester import Backtester, load_trader_from_file
 
 # --- Configuration & Environment Variables ---
-CLUB_PASSWORD = os.getenv("CLUB_PASSWORD", "quantclub2026")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin_secret_2026")
+CLUB_PASSWORD = os.getenv("CLUB_PASSWORD", "password")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 # Secret comma-separated regimes (Bull, Bear, Volatile) — NEVER shown in the UI
 SECRET_OOS_WINDOWS = os.getenv(
     "SECRET_OOS_WINDOWS",
-    "2019-01-01:2019-12-31,2025-01-01:2025-12-31",
+    "2018-01-01:2018-12-31,2019-01-01:2019-12-31",
 )
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "6"))
 SUBMISSIONS_DIR = "data/submissions"
@@ -38,9 +38,13 @@ def get_oos_spy_benchmark(windows_str: str):
 
     return {
         "sharpe": float(sum(m["sharpe"] for m in metrics_list) / len(metrics_list)),
-        "total_return_pct": float(sum(m["total_return_pct"] for m in metrics_list) / len(metrics_list)),
+        "total_return_pct": float(
+            sum(m["total_return_pct"] for m in metrics_list) / len(metrics_list)
+        ),
         "max_drawdown_pct": float(min(m["max_drawdown_pct"] for m in metrics_list)),
-        "final_equity": float(sum(m["final_equity"] for m in metrics_list) / len(metrics_list)),
+        "final_equity": float(
+            sum(m["final_equity"] for m in metrics_list) / len(metrics_list)
+        ),
         "regimes": len(metrics_list),
     }
 
@@ -139,14 +143,14 @@ def get_leaderboard() -> pd.DataFrame:
 
 init_db()
 st.set_page_config(page_title="Quant Club Prosperity Leaderboard", layout="wide")
-st.title("🏛️ Nova Quant Club — Strategy Leaderboard & Backtester")
+st.title("Nova Quant Club — Strategy Leaderboard")
 
 sections = [
-    "🏆 Leaderboard",
-    "🧪 Backtester",
-    "🚀 Submit to Leaderboard",
-    "📖 Guide",
-    "🔒 Admin",
+    "Leaderboard",
+    "Backtester",
+    "Submit to Leaderboard",
+    "Guide",
+    "Admin",
 ]
 if st.session_state.pop("redirect_to_leaderboard", False):
     st.session_state["section_selector"] = "🏆 Leaderboard"
@@ -161,12 +165,16 @@ active_section = st.radio(
 # --- TAB 1: LEADERBOARD ---
 if active_section == "🏆 Leaderboard":
     st.subheader("Official Out-Of-Sample Rankings")
-    st.caption("Evaluated across undisclosed multi-regime market windows | Ranked by Mean Annualized Sharpe Ratio (10 bps fee/slippage, 4% RF rate)")
+    st.caption(
+        "Evaluated across undisclosed multi-regime market windows | Ranked by Mean Annualized Sharpe Ratio (10 bps fee/slippage, 4% RF rate)"
+    )
 
     # Pinned SPY Benchmark Reference Bar
     try:
         spy_bench = get_oos_spy_benchmark(SECRET_OOS_WINDOWS)
-        st.markdown(f"##### 📌 Benchmark Reference: `SPY` Buy-and-Hold (Mean across {spy_bench['regimes']} Secret Regimes)")
+        st.markdown(
+            f"##### 📌 Benchmark Reference: `SPY` Buy-and-Hold (Mean across {spy_bench['regimes']} Secret Regimes)"
+        )
         b1, b2, b3, b4 = st.columns(4)
         b1.metric("SPY Mean Sharpe", f"{spy_bench['sharpe']:.3f}")
         b2.metric("SPY Mean Return", f"{spy_bench['total_return_pct']:.2f}%")
@@ -180,7 +188,7 @@ if active_section == "🏆 Leaderboard":
     if lb_df.empty:
         st.info("No strategies submitted yet. Head over to the Submit tab to beat SPY!")
     else:
-        st.dataframe(lb_df, width='stretch')
+        st.dataframe(lb_df, width="stretch")
 
 # --- TAB 2: WEB SANDBOX BACKTESTER ---
 if active_section == "🧪 Backtester":
@@ -245,7 +253,7 @@ if active_section == "🧪 Backtester":
                 st.markdown("#### Equity Curve: Strategy vs. SPY Buy-and-Hold")
                 st.line_chart(
                     res["equity_df"][["Strategy", "SPY_Benchmark"]],
-                    width='stretch',
+                    width="stretch",
                 )
             except Exception as e:
                 st.error(f"Backtest Error: {e}")
@@ -259,7 +267,9 @@ if active_section == "🚀 Submit to Leaderboard":
     )
 
     with st.form("submission_form"):
-        st.info("The leaderboard uses the uploaded strategy's `Trader.author` and `Trader.name` values.")
+        st.info(
+            "The leaderboard uses the uploaded strategy's `Trader.author` and `Trader.name` values."
+        )
         password_input = st.text_input("Club Upload Password", type="password")
         sub_file = st.file_uploader("Upload Strategy (.py)", type=["py"])
         submitted = st.form_submit_button("Evaluate & Post to Leaderboard")
@@ -297,7 +307,9 @@ if active_section == "🚀 Submit to Leaderboard":
                     if row and row[0]:
                         try:
                             last_sub = datetime.strptime(row[0], "%Y-%m-%d %H:%M UTC")
-                            hours_since = (datetime.utcnow() - last_sub).total_seconds() / 3600.0
+                            hours_since = (
+                                datetime.utcnow() - last_sub
+                            ).total_seconds() / 3600.0
                             if hours_since < COOLDOWN_HOURS:
                                 remaining = COOLDOWN_HOURS - hours_since
                                 st.error(
@@ -309,8 +321,12 @@ if active_section == "🚀 Submit to Leaderboard":
                             pass
 
                     if not cooldown_blocked:
-                        with st.spinner("Evaluating across secret multi-regime OOS windows vs SPY..."):
-                            saved_path = os.path.join(SUBMISSIONS_DIR, f"{safe_name}.py")
+                        with st.spinner(
+                            "Evaluating across secret multi-regime OOS windows vs SPY..."
+                        ):
+                            saved_path = os.path.join(
+                                SUBMISSIONS_DIR, f"{safe_name}.py"
+                            )
                             with open(saved_path, "wb") as f:
                                 f.write(sub_file.getvalue())
 
@@ -399,7 +415,9 @@ if active_section == "🔒 Admin":
                 st.warning("Please specify at least one evaluation window.")
             else:
                 py_files = sorted(
-                    fname for fname in os.listdir(SUBMISSIONS_DIR) if fname.endswith(".py")
+                    fname
+                    for fname in os.listdir(SUBMISSIONS_DIR)
+                    if fname.endswith(".py")
                 )
                 if not py_files:
                     st.info("No uploaded strategies found.")

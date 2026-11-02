@@ -3,20 +3,26 @@ import numpy as np
 
 class Trader:
     # Any valid yfinance ticker(s)
-    tickers = ["SPY", "QQQ", "GLD"] # Mandatory: declare the tickers you want to trade here
+    tickers = [
+        "SPY",
+        "QQQ",
+        "GLD",
+    ]  # Mandatory: declare the tickers you want to trade here
 
     def __init__(self):
-        self.name = "Simple Moving Average Crossover" # Mandatory: give your strategy a name
-        self.author = "Your Name" # Mandatory: give your name or alias
-        
-        self.short_window = 10 
+        self.name = (
+            "Simple Moving Average Crossover"  # Mandatory: give your strategy a name
+        )
+        self.author = "Your Name"  # Mandatory: give your name or alias
+
+        self.short_window = 10
         self.long_window = 40
 
     def run(self, state) -> dict:
         """
         Called at the close of every trading day.
         Returns a dictionary of {ticker:shares_to_buy_or_sell} executed at next day's Open.
-        
+
         Available state attributes:
         state.step              # Anonymized integer bar index (0, 1, 2, ...)
         state.history           # Indexed 0..step, prices normalized to base 100.0
@@ -35,8 +41,8 @@ class Trader:
                 continue
 
             closes = df["Close"]
-            sma_short = closes.iloc[-self.short_window:].mean()
-            sma_long = closes.iloc[-self.long_window:].mean()
+            sma_short = closes.iloc[-self.short_window :].mean()
+            sma_long = closes.iloc[-self.long_window :].mean()
             current_price = float(closes.iloc[-1])
             current_pos = state.positions.get(ticker, 0.0)
 
@@ -48,8 +54,8 @@ class Trader:
             else:
                 orders[ticker] = -current_pos
 
-        print(f"Orders for {state.current_date}: {orders}")
         return orders
+
 
 if __name__ == "__main__":
     import argparse
