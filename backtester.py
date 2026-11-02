@@ -171,11 +171,11 @@ class Backtester:
                 open_price = float(data[t].iloc[data_index]["Open"])
                 if open_price <= 0 or np.isnan(open_price) or qty == 0:
                     continue
-                if qty > 0:
+                if qty < 0:
+                    qty = max(-positions[t], qty)
+                elif qty > 0:
                     max_affordable = cash / (open_price * (1.0 + self.commission_rate))
                     qty = min(qty, max_affordable)
-                elif qty < 0:
-                    qty = max(-positions[t], qty)
 
                 trade_val = qty * open_price
                 fee = abs(trade_val) * self.commission_rate
