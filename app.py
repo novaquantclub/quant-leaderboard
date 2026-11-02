@@ -32,6 +32,14 @@ def get_oos_spy_benchmark(windows_str: str):
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         table_sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'leaderboard'"
         ).fetchone()
@@ -79,6 +87,45 @@ def init_db():
         columns = [row[1] for row in conn.execute("PRAGMA table_info(leaderboard)")]
         if "equity_curve" not in columns:
             conn.execute("ALTER TABLE leaderboard ADD COLUMN equity_curve TEXT")
+
+
+def get_evaluation_windows() -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = 'evaluation_windows'"
+        ).fetchone()
+    return row[0] if row else SECRET_OOS_WINDOWS
+
+
+def save_evaluation_windows(windows: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value)
+            VALUES ('evaluation_windows', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (windows,),
+        )
+
+
+def validate_evaluation_windows(windows: str) -> str | None:
+    entries = [entry.strip() for entry in windows.split(",") if entry.strip()]
+    if not entries:
+        return "Please specify at least one evaluation window."
+
+    for entry in entries:
+        parts = [part.strip() for part in entry.split(":")]
+        if len(parts) != 2:
+            return f"Invalid window `{entry}`. Use YYYY-MM-DD:YYYY-MM-DD."
+        try:
+            start = datetime.strptime(parts[0], "%Y-%m-%d")
+            end = datetime.strptime(parts[1], "%Y-%m-%d")
+        except ValueError:
+            return f"Invalid window `{entry}`. Use YYYY-MM-DD:YYYY-MM-DD."
+        if start >= end:
+            return f"Invalid window `{entry}`. The end date must be after the start date."
+    return None
 
 
 def serialize_equity_curve(curve_df: pd.DataFrame) -> str:
@@ -153,7 +200,6 @@ def get_leaderboard() -> pd.DataFrame:
                 member_name AS "Member",
                 strategy_name AS "Strategy",
                 sharpe AS "Sharpe",
-                excess_sharpe AS "vs SPY Sharpe",
                 total_return_pct AS "Return (%)",
                 alpha_pct AS "Alpha (%)",
                 beta AS "Beta",
@@ -193,6 +239,7 @@ def get_equity_curves() -> dict:
 
 
 init_db()
+active_evaluation_windows = get_evaluation_windows()
 st.set_page_config(page_title="Quant Club Prosperity Leaderboard", layout="wide")
 st.title("Nova Quant Club — Strategy Leaderboard")
 
@@ -209,7 +256,7 @@ with leaderboard_tab:
 
     # Pinned SPY Benchmark Reference Bar
     try:
-        spy_bench = get_oos_spy_benchmark(SECRET_OOS_WINDOWS)
+        spy_bench = get_oos_spy_benchmark(active_evaluation_windows)
         st.markdown(f"##### Benchmark Reference: `SPY` Buy-and-Hold")
         b1, b2, b3, b4 = st.columns(4)
         b1.metric("SPY Sharpe", f"{spy_bench['sharpe']:.3f}")
@@ -230,7 +277,7 @@ with leaderboard_tab:
         st.caption(
             "Equity paths are precomputed when a strategy is scored and loaded from the "
             "database. The hidden regimes are stitched together in order as one continuous "
-            "portfolio, starting at $100,000. SPY buy-and-hold is always included."
+            "portfolio, starting at $100,000."
         )
 
         options = {
@@ -274,10 +321,6 @@ with leaderboard_tab:
         else:
             st.markdown("#### Portfolio Equity")
             st.line_chart(chart_df, height=420, width="stretch")
-            st.caption(
-                "Regimes are concatenated in evaluation order, so each curve represents "
-                "one continuous portfolio rather than an average across regimes."
-            )
 
         if missing_curves:
             st.warning(
@@ -437,7 +480,9 @@ with submission_tab:
                                 f.write(sub_file.getvalue())
 
                             bt = Backtester(anonymize=True)
-                            res = bt.run_multi_window(saved_path, SECRET_OOS_WINDOWS)
+                            res = bt.run_multi_window(
+                                saved_path, active_evaluation_windows
+                            )
 
                             upsert_submission(clean_member, clean_strat, res)
                             diff = res["sharpe"] - res["spy_sharpe"]
@@ -511,47 +556,53 @@ with admin_tab:
         st.success("Admin access granted.")
         new_windows = st.text_input(
             "Evaluation Window(s)",
-            value=SECRET_OOS_WINDOWS,
+            value=active_evaluation_windows,
             placeholder="YYYY-MM-DD:YYYY-MM-DD,YYYY-MM-DD:YYYY-MM-DD",
             help="Use comma-separated start:end windows.",
             key="admin_windows",
         )
 
+        if st.button("Submit Changes", key="admin_save_windows"):
+            validation_error = validate_evaluation_windows(new_windows)
+            if validation_error:
+                st.error(validation_error)
+            else:
+                save_evaluation_windows(new_windows.strip())
+                active_evaluation_windows = new_windows.strip()
+                st.success("Evaluation windows updated.")
+
         st.markdown("#### Re-evaluate strategies")
         if st.button("Re-Score Entire Leaderboard", key="admin_rescore"):
-            if not new_windows.strip():
-                st.warning("Please specify at least one evaluation window.")
+            py_files = sorted(
+                fname
+                for fname in os.listdir(SUBMISSIONS_DIR)
+                if fname.endswith(".py")
+            )
+            if not py_files:
+                st.info("No uploaded strategies found.")
             else:
-                py_files = sorted(
-                    fname
-                    for fname in os.listdir(SUBMISSIONS_DIR)
-                    if fname.endswith(".py")
-                )
-                if not py_files:
-                    st.info("No uploaded strategies found.")
-                else:
-                    bt = Backtester(anonymize=True)
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    success_count = 0
-                    for idx, fname in enumerate(py_files):
-                        fpath = os.path.join(SUBMISSIONS_DIR, fname)
-                        status_text.text(
-                            f"Re-evaluating {fname} ({idx + 1}/{len(py_files)})..."
-                        )
-                        try:
-                            member, strategy = get_strategy_metadata(fpath)
-                            result = bt.run_multi_window(fpath, new_windows.strip())
-                            upsert_submission(member, strategy, result)
-                            success_count += 1
-                        except Exception as e:
-                            st.warning(f"Failed to re-evaluate {fname}: {e}")
-                        progress_bar.progress((idx + 1) / len(py_files))
-                    status_text.empty()
-                    st.success(
-                        f"Successfully re-scored {success_count}/{len(py_files)} strategies."
+                bt = Backtester(anonymize=True)
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                success_count = 0
+                for idx, fname in enumerate(py_files):
+                    fpath = os.path.join(SUBMISSIONS_DIR, fname)
+                    status_text.text(
+                        f"Re-evaluating {fname} ({idx + 1}/{len(py_files)})..."
                     )
-                    st.rerun()
+                    try:
+                        member, strategy = get_strategy_metadata(fpath)
+                        result = bt.run_multi_window(fpath, active_evaluation_windows)
+                        upsert_submission(member, strategy, result)
+                        success_count += 1
+                    except Exception as e:
+                        st.warning(f"Failed to re-evaluate {fname}: {e}")
+                    progress_bar.progress((idx + 1) / len(py_files))
+                status_text.empty()
+                st.success(
+                    f"Successfully re-scored {success_count}/{len(py_files)} strategies."
+                )
+                st.rerun()
 
         st.markdown("#### Download uploaded strategies")
         py_files = sorted(
