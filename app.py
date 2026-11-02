@@ -240,7 +240,7 @@ def get_equity_curves() -> dict:
 
 init_db()
 active_evaluation_windows = get_evaluation_windows()
-st.set_page_config(page_title="Quant Club Prosperity Leaderboard", layout="wide")
+st.set_page_config(page_title="Leaderboard - Nova Quant Club ", layout="wide")
 st.title("Nova Quant Club — Strategy Leaderboard")
 
 leaderboard_tab, backtester_tab, submission_tab, guide_tab, admin_tab = st.tabs(
