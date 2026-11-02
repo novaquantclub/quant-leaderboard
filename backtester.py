@@ -17,12 +17,17 @@ def is_read_only_symbol(symbol: str) -> bool:
 
 
 def chain_equity_curves(curves: List[pd.Series], initial_value: float) -> pd.Series:
-    """Concatenate per-regime equity paths, carrying the ending level forward."""
+    """Concatenate per-regime paths while preserving each curve's first return."""
     parts = []
     level = float(initial_value)
-    for curve in curves:
-        part = curve.astype(float) / float(curve.iloc[0]) * level
+    for index, curve in enumerate(curves):
+        curve_with_start = pd.concat(
+            [pd.Series([initial_value]), curve.astype(float)], ignore_index=True
+        )
+        part = curve_with_start / float(curve_with_start.iloc[0]) * level
         level = float(part.iloc[-1])
+        if index > 0:
+            part = part.iloc[1:]
         parts.append(part.reset_index(drop=True))
     return pd.concat(parts, ignore_index=True)
 
@@ -112,11 +117,15 @@ class Backtester:
             )
             for ticker in tickers
         }
-        spy_df = self._download_single(self.benchmark_ticker, start_date, end_date)
-
-        available_dates = sorted(
-            list(set().union(*(df.index for df in raw_data.values())))
+        spy_df = self._download_single(
+            self.benchmark_ticker,
+            buffer_start.strftime("%Y-%m-%d"),
+            end_date,
         )
+
+        # Use the benchmark's trading calendar as the master clock so assets
+        # with broader calendars cannot introduce non-equity evaluation bars.
+        available_dates = sorted(spy_df.index)
         evaluation_dates = [
             date for date in available_dates if evaluation_start <= date < evaluation_end
         ]
@@ -141,7 +150,7 @@ class Backtester:
                 base_vol = (
                     float(
                         aligned["Volume"]
-                        .iloc[warmup_end_index : warmup_end_index + 5]
+                        .iloc[warmup_end_index - 20 : warmup_end_index]
                         .mean()
                     )
                     or 1.0
@@ -167,7 +176,7 @@ class Backtester:
             data_index = warmup_end_index + step_idx
 
             # 1. Execute orders from previous bar at today's OPEN price
-            for t, qty in pending_orders.items():
+            for t, qty in sorted(pending_orders.items(), key=lambda x: x[1]):
                 open_price = float(data[t].iloc[data_index]["Open"])
                 if open_price <= 0 or np.isnan(open_price) or qty == 0:
                     continue
@@ -219,9 +228,11 @@ class Backtester:
                 for key, value in orders.items():
                     symbol = str(key).upper()
                     quantity = float(value)
+                    if not np.isfinite(quantity) or quantity == 0:
+                        continue
                     if symbol not in tickers:
                         continue
-                    if quantity != 0 and is_read_only_symbol(symbol):
+                    if is_read_only_symbol(symbol):
                         continue
                     pending_orders[symbol] = quantity
 
@@ -277,9 +288,9 @@ class Backtester:
             res = self.run(fresh_trader, start_d.strip(), end_d.strip())
             results.append(res)
 
-        # Stitch each regime's path onto the end of the previous one. Every run
-        # starts from flat cash, so we chain the relative performance and carry
-        # the ending level forward. Indexes stay anonymized (bar numbers only).
+        # Stitch each regime's path onto the end of the previous one. The
+        # prepended baseline preserves each window's first trading-day return,
+        # while subsequent baselines are dropped to avoid duplicate seam bars.
         strategy_curve = chain_equity_curves(
             [res["equity_df"]["Strategy"] for res in results], self.initial_cash
         )
