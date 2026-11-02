@@ -8,7 +8,7 @@ from backtester import Backtester, load_trader_from_file
 
 # --- Configuration & Environment Variables ---
 CLUB_PASSWORD = os.getenv("CLUB_PASSWORD", "password")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "password")
 # Secret comma-separated regimes (Bull, Bear, Volatile) — NEVER shown in the UI
 SECRET_OOS_WINDOWS = os.getenv(
     "SECRET_OOS_WINDOWS",
@@ -69,9 +69,7 @@ def init_db():
                     submitted_at TEXT
                 )
                 """)
-            conn.execute(
-                "INSERT INTO leaderboard_new SELECT * FROM leaderboard"
-            )
+            conn.execute("INSERT INTO leaderboard_new SELECT * FROM leaderboard")
             conn.execute("DROP TABLE leaderboard")
             conn.execute("ALTER TABLE leaderboard_new RENAME TO leaderboard")
         else:
@@ -89,13 +87,11 @@ def init_db():
                     submitted_at TEXT
                 )
                 """)
-        conn.execute(
-            """
+        conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS
             idx_leaderboard_member_strategy
             ON leaderboard(member_name, strategy_name)
-            """
-        )
+            """)
 
 
 def upsert_submission(member_name, strategy_name, res):
@@ -155,7 +151,7 @@ def get_leaderboard() -> pd.DataFrame:
             SELECT 
                 member_name AS "Member",
                 strategy_name AS "Strategy",
-                sharpe AS "OOS Sharpe",
+                sharpe AS "Sharpe",
                 excess_sharpe AS "vs SPY Sharpe",
                 total_return_pct AS "Return (%)",
                 alpha_pct AS "Alpha (%)",
@@ -172,30 +168,46 @@ def get_leaderboard() -> pd.DataFrame:
     return df
 
 
+def find_strategy_file(member_name: str, strategy_name: str):
+    """Locate the uploaded .py file behind a leaderboard entry."""
+    for fname in sorted(os.listdir(SUBMISSIONS_DIR)):
+        if not fname.endswith(".py"):
+            continue
+        fpath = os.path.join(SUBMISSIONS_DIR, fname)
+        try:
+            member, strategy = get_strategy_metadata(fpath)
+        except Exception:
+            continue
+        if member == member_name and strategy == strategy_name:
+            return fpath
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_strategy_equity_curves(filepath: str, windows_str: str, file_mtime: float):
+    """Re-runs a submitted strategy over the hidden regimes and returns base-100 curves.
+
+    `file_mtime` is only used to invalidate the cache when a strategy file changes.
+    """
+    bt = Backtester(anonymize=True)
+    res = bt.run_multi_window(filepath, windows_str)
+    return {
+        "mean_equity_df": res["mean_equity_df"],
+        "regime_equity_curves": res["regime_equity_curves"],
+    }
+
+
 init_db()
 st.set_page_config(page_title="Quant Club Prosperity Leaderboard", layout="wide")
 st.title("Nova Quant Club — Strategy Leaderboard")
 
-sections = [
-    "Leaderboard",
-    "Backtester",
-    "Submit to Leaderboard",
-    "Guide",
-    "Admin",
-]
-if st.session_state.pop("redirect_to_leaderboard", False):
-    st.session_state["section_selector"] = "Leaderboard"
-active_section = st.radio(
-    "Section",
-    sections,
-    horizontal=True,
-    label_visibility="collapsed",
-    key="section_selector",
+leaderboard_tab, backtester_tab, submission_tab, guide_tab, admin_tab = st.tabs(
+    ["Leaderboard", "Backtester", "Submit to Leaderboard", "Guide", "Admin"]
 )
 
 # --- TAB 1: LEADERBOARD ---
-if active_section == "Leaderboard":
-    st.subheader("Official Out-Of-Sample Rankings")
+with leaderboard_tab:
+    st.subheader("Official Rankings")
     st.caption(
         "Evaluated across undisclosed multi-regime market windows | Ranked by Mean Annualized Sharpe Ratio (10 bps fee/slippage, 4% RF rate)"
     )
@@ -203,9 +215,7 @@ if active_section == "Leaderboard":
     # Pinned SPY Benchmark Reference Bar
     try:
         spy_bench = get_oos_spy_benchmark(SECRET_OOS_WINDOWS)
-        st.markdown(
-            f"##### 📌 Benchmark Reference: `SPY` Buy-and-Hold (Mean across {spy_bench['regimes']} Secret Regimes)"
-        )
+        st.markdown(f"##### Benchmark Reference: `SPY` Buy-and-Hold")
         b1, b2, b3, b4 = st.columns(4)
         b1.metric("SPY Mean Sharpe", f"{spy_bench['sharpe']:.3f}")
         b2.metric("SPY Mean Return", f"{spy_bench['total_return_pct']:.2f}%")
@@ -221,9 +231,112 @@ if active_section == "Leaderboard":
     else:
         st.dataframe(lb_df, width="stretch")
 
+        st.markdown("##### Equity Curve Comparison")
+        st.caption(
+            "Re-runs the selected submissions over the hidden evaluation regimes and plots "
+            "base-100 equity curves. Regime averaging is done bar-by-bar, so calendar dates stay hidden."
+        )
+
+        options = {
+            f"{row['Member']} — {row['Strategy']}": (row["Member"], row["Strategy"])
+            for _, row in lb_df.iterrows()
+        }
+        chosen_labels = st.multiselect(
+            "Strategies to compare",
+            list(options),
+            default=list(options)[: min(3, len(options))],
+            key="lb_compare_select",
+        )
+        c_spy, c_view = st.columns(2)
+        include_spy = c_spy.checkbox(
+            "Include SPY buy-and-hold benchmark", value=True, key="lb_compare_spy"
+        )
+        view = c_view.radio(
+            "Curve view",
+            ["Average across regimes", "Single regime"],
+            horizontal=True,
+            key="lb_compare_view",
+        )
+
+        if st.button("Generate Equity Curves", key="lb_compare_btn"):
+            if not chosen_labels:
+                st.warning("Select at least one strategy to compare.")
+            else:
+                mean_cols = {}
+                spy_mean = None
+                regime_frames = {}
+                errors = []
+                progress = st.progress(0.0)
+                for idx, label in enumerate(chosen_labels):
+                    member, strategy = options[label]
+                    fpath = find_strategy_file(member, strategy)
+                    if fpath is None:
+                        errors.append(f"{label}: uploaded strategy file not found.")
+                        continue
+                    try:
+                        data = get_strategy_equity_curves(
+                            fpath, SECRET_OOS_WINDOWS, os.path.getmtime(fpath)
+                        )
+                    except Exception as e:
+                        errors.append(f"{label}: {e}")
+                        continue
+
+                    mean_cols[label] = data["mean_equity_df"]["Strategy"]
+                    if spy_mean is None:
+                        spy_mean = data["mean_equity_df"]["SPY_Benchmark"]
+                    for regime_label, curve in data["regime_equity_curves"].items():
+                        regime_frames.setdefault(regime_label, {})
+                        regime_frames[regime_label][label] = curve["Strategy"]
+                        regime_frames[regime_label].setdefault(
+                            "SPY Buy-and-Hold", curve["SPY_Benchmark"]
+                        )
+                    progress.progress((idx + 1) / len(chosen_labels))
+                progress.empty()
+
+                for err in errors:
+                    st.error(err)
+
+                st.session_state["lb_equity_comparison"] = {
+                    "mean": pd.DataFrame(mean_cols),
+                    "spy_mean": spy_mean,
+                    "regimes": {
+                        name: pd.DataFrame(frame)
+                        for name, frame in regime_frames.items()
+                    },
+                    "labels": [label for label in chosen_labels if label in mean_cols],
+                }
+
+        comparison = st.session_state.get("lb_equity_comparison")
+        if comparison and not comparison["mean"].empty:
+            picked_regime = None
+            if view == "Single regime" and comparison["regimes"]:
+                picked_regime = st.selectbox(
+                    "Hidden regime", list(comparison["regimes"]), key="lb_regime_pick"
+                )
+                chart_df = comparison["regimes"][picked_regime].copy()
+            else:
+                chart_df = comparison["mean"].copy()
+                if comparison["spy_mean"] is not None:
+                    chart_df["SPY Buy-and-Hold"] = comparison["spy_mean"]
+
+            if not include_spy and "SPY Buy-and-Hold" in chart_df.columns:
+                chart_df = chart_df.drop(columns=["SPY Buy-and-Hold"])
+
+            st.markdown("#### Portfolio Equity (Base 100)")
+            caption = f"Showing: {', '.join(comparison['labels'])}"
+            if picked_regime:
+                caption += f" | {picked_regime}"
+            st.caption(caption)
+            st.line_chart(chart_df, height=420, width="stretch")
+            st.caption(
+                "Each series starts at 100. The average view averages every trading-day "
+                "bar across the hidden regimes; shorter regimes contribute until their last bar."
+            )
+
+
 # --- TAB 2: WEB SANDBOX BACKTESTER ---
-if active_section == "Backtester":
-    st.subheader("Interactive In-Sample Web Backtester (vs. SPY Buy & Hold)")
+with backtester_tab:
+    st.subheader("Interactive Backtester")
     st.write(
         "Test your `.py` strategy file on historical In-Sample dates and compare your equity curve directly against `SPY`."
     )
@@ -232,12 +345,12 @@ if active_section == "Backtester":
     with col1:
         is_start = st.date_input(
             "Start Date",
-            value=pd.to_datetime("2023-01-01"),
+            value=pd.to_datetime("2024-01-01"),
         )
     with col2:
         is_end = st.date_input(
             "End Date",
-            value=pd.to_datetime("2024-12-31"),
+            value=pd.to_datetime("2025-12-31"),
         )
 
     sandbox_file = st.file_uploader(
@@ -290,12 +403,15 @@ if active_section == "Backtester":
                 st.error(f"Backtest Error: {e}")
 
 # --- TAB 3: OFFICIAL SUBMISSION ---
-if active_section == "Submit to Leaderboard":
-    st.subheader("Submit Strategy for Official OOS Evaluation")
+with submission_tab:
+    st.subheader("Submit Strategy to the Leaderboard")
     st.caption(
         f"Strategies are evaluated across multiple undisclosed historical market regimes "
         f"with anonymized timestamps and base-100 prices. Submission cooldown: **{COOLDOWN_HOURS:g} hours**."
     )
+    submission_success = st.session_state.pop("submission_success", None)
+    if submission_success:
+        st.success(submission_success)
 
     with st.form("submission_form"):
         st.info(
@@ -321,7 +437,8 @@ if active_section == "Submit to Leaderboard":
 
                     clean_member, clean_strat = get_strategy_metadata(tmp_path)
                     safe_name = "".join(
-                        c for c in f"{clean_member}_{clean_strat}"
+                        c
+                        for c in f"{clean_member}_{clean_strat}"
                         if c.isalnum() or c in ("_", "-")
                     )
                     if not safe_name:
@@ -371,14 +488,14 @@ if active_section == "Submit to Leaderboard":
 
                             upsert_submission(clean_member, clean_strat, res)
                             diff = res["sharpe"] - res["spy_sharpe"]
-                            st.success(
+                            st.session_state["submission_success"] = (
                                 f"✅ Submitted across **{res['regimes_tested']}** hidden regimes! "
                                 f"Mean OOS Sharpe: **{res['sharpe']:.3f}** ({diff:+.3f} vs SPY) | "
                                 f"Worst Regime Sharpe: **{res['min_regime_sharpe']:.3f}** | "
                                 f"Mean Alpha: **{res['alpha_pct']:+.2f}%** | "
-                                f"Mean Beta: **{res['beta']:.2f}**"
+                                f"Mean Beta: **{res['beta']:.2f}**. "
+                                "Check the Leaderboard tab to see your submission."
                             )
-                            st.session_state["redirect_to_leaderboard"] = True
                             st.rerun()
                 except Exception as e:
                     if saved_path and os.path.exists(saved_path):
@@ -387,8 +504,9 @@ if active_section == "Submit to Leaderboard":
                 finally:
                     if tmp_path and os.path.exists(tmp_path):
                         os.remove(tmp_path)
+
 # --- TAB 4: LOCAL SDK & RULES ---
-if active_section == "Guide":
+with guide_tab:
     st.subheader("Download Local Backtester & Strategy Template")
     st.write(
         "Develop locally using the exact same execution engine and SPY benchmark comparison running on this server."
@@ -429,7 +547,7 @@ if active_section == "Guide":
     """)
     st.code(sample_code, language="python")
 
-if active_section == "Admin":
+with admin_tab:
     st.subheader("Organizer Administration")
     admin_pw = st.text_input("Admin Password", type="password", key="admin_password")
 

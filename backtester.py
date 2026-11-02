@@ -213,6 +213,32 @@ class Backtester:
             res = self.run(fresh_trader, start_d.strip(), end_d.strip())
             results.append(res)
 
+        # Base-100 equity curves per regime, indexed by anonymized bar number so
+        # no calendar dates ever leave the backtester.
+        regime_equity_curves = {}
+        normalized_curves = []
+        for regime_idx, res in enumerate(results, start=1):
+            curve = res["equity_df"][["Strategy", "SPY_Benchmark"]].copy()
+            curve = curve / self.initial_cash * 100.0
+            curve.index = pd.RangeIndex(len(curve))
+            regime_equity_curves[f"Regime {regime_idx}"] = curve
+            normalized_curves.append(curve)
+
+        # Average each bar across every regime. Only the bars covered by all
+        # regimes are kept: otherwise the tail would silently drop the shorter
+        # regimes and the "average" would jump toward the longest one's path.
+        common_len = min(len(curve) for curve in normalized_curves)
+        mean_equity_df = pd.DataFrame(
+            {
+                col: pd.concat(
+                    [curve[col].iloc[:common_len] for curve in normalized_curves],
+                    axis=1,
+                ).mean(axis=1)
+                for col in ("Strategy", "SPY_Benchmark")
+            }
+        )
+        mean_equity_df.index.name = "Trading Day"
+
         # Robust aggregation across regimes: average metrics, penalize high variance across regimes
         sharpes = [r["sharpe"] for r in results]
         spy_sharpes = [r["spy_sharpe"] for r in results]
@@ -228,6 +254,8 @@ class Backtester:
             "beta": float(np.mean([r["beta"] for r in results])),
             "tickers": results[0]["tickers"],
             "regimes_tested": len(results),
+            "mean_equity_df": mean_equity_df,
+            "regime_equity_curves": regime_equity_curves,
         }
 
 
