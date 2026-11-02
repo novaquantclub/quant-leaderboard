@@ -7,6 +7,17 @@ import pandas as pd
 import yfinance as yf
 
 
+def chain_equity_curves(curves: List[pd.Series], initial_value: float) -> pd.Series:
+    """Concatenate per-regime equity paths, carrying the ending level forward."""
+    parts = []
+    level = float(initial_value)
+    for curve in curves:
+        part = curve.astype(float) / float(curve.iloc[0]) * level
+        level = float(part.iloc[-1])
+        parts.append(part.reset_index(drop=True))
+    return pd.concat(parts, ignore_index=True)
+
+
 @dataclass
 class TradingState:
     step: int  # Anonymized integer bar index (0, 1, 2, ...)
@@ -205,6 +216,11 @@ class Backtester:
         """
         Evaluates a fresh Trader instance across multiple secret (start, end) regimes.
         windows_str format: "2018-09-01:2019-04-01,2022-01-01:2022-10-01,2025-02-01:2026-10-01"
+
+        Regimes are stitched together sequentially: the ending equity of one
+        regime becomes the starting equity of the next, giving one continuous
+        portfolio path. All reported metrics are calculated from that combined
+        path rather than averaged per regime.
         """
         pairs = [w.strip().split(":") for w in windows_str.split(",") if ":" in w]
         results = []
@@ -213,49 +229,67 @@ class Backtester:
             res = self.run(fresh_trader, start_d.strip(), end_d.strip())
             results.append(res)
 
-        # Base-100 equity curves per regime, indexed by anonymized bar number so
-        # no calendar dates ever leave the backtester.
-        regime_equity_curves = {}
-        normalized_curves = []
-        for regime_idx, res in enumerate(results, start=1):
-            curve = res["equity_df"][["Strategy", "SPY_Benchmark"]].copy()
-            curve = curve / self.initial_cash * 100.0
-            curve.index = pd.RangeIndex(len(curve))
-            regime_equity_curves[f"Regime {regime_idx}"] = curve
-            normalized_curves.append(curve)
-
-        # Average each bar across every regime. Only the bars covered by all
-        # regimes are kept: otherwise the tail would silently drop the shorter
-        # regimes and the "average" would jump toward the longest one's path.
-        common_len = min(len(curve) for curve in normalized_curves)
-        mean_equity_df = pd.DataFrame(
-            {
-                col: pd.concat(
-                    [curve[col].iloc[:common_len] for curve in normalized_curves],
-                    axis=1,
-                ).mean(axis=1)
-                for col in ("Strategy", "SPY_Benchmark")
-            }
+        # Stitch each regime's path onto the end of the previous one. Every run
+        # starts from flat cash, so we chain the relative performance and carry
+        # the ending level forward. Indexes stay anonymized (bar numbers only).
+        strategy_curve = chain_equity_curves(
+            [res["equity_df"]["Strategy"] for res in results], self.initial_cash
         )
-        mean_equity_df.index.name = "Trading Day"
+        spy_curve = chain_equity_curves(
+            [res["equity_df"]["SPY_Benchmark"] for res in results], self.initial_cash
+        )
+        absolute_equity = pd.DataFrame(
+            {"Strategy": strategy_curve, "SPY_Benchmark": spy_curve}
+        )
+        absolute_equity.index.name = "Trading Day"
 
-        # Robust aggregation across regimes: average metrics, penalize high variance across regimes
-        sharpes = [r["sharpe"] for r in results]
-        spy_sharpes = [r["spy_sharpe"] for r in results]
+        # Score the concatenated curve exactly like a single backtest.
+        strat_m = self._calc_metrics(absolute_equity["Strategy"])
+        spy_m = self._calc_metrics(absolute_equity["SPY_Benchmark"])
+
+        cov_matrix = np.cov(strat_m["excess_returns"], spy_m["excess_returns"])
+        spy_var = cov_matrix[1, 1]
+        beta = float(cov_matrix[0, 1] / spy_var) if spy_var > 1e-12 else 0.0
+        daily_alpha = (
+            strat_m["excess_returns"].mean() - beta * spy_m["excess_returns"].mean()
+        )
+        alpha_annual_pct = float(daily_alpha * 252 * 100.0)
+
+        equity_curve_df = absolute_equity.copy()
+        equity_curve_df.index.name = "Trading Day"
+
         return {
-            "sharpe": float(np.mean(sharpes)),
-            "min_regime_sharpe": float(np.min(sharpes)),
-            "spy_sharpe": float(np.mean(spy_sharpes)),
-            "total_return_pct": float(
-                np.mean([r["total_return_pct"] for r in results])
-            ),
-            "max_drawdown_pct": float(np.min([r["max_drawdown_pct"] for r in results])),
-            "alpha_pct": float(np.mean([r["alpha_pct"] for r in results])),
-            "beta": float(np.mean([r["beta"] for r in results])),
+            "sharpe": strat_m["sharpe"],
+            "spy_sharpe": spy_m["sharpe"],
+            "total_return_pct": strat_m["total_return_pct"],
+            "max_drawdown_pct": strat_m["max_drawdown_pct"],
+            "alpha_pct": alpha_annual_pct,
+            "beta": beta,
             "tickers": results[0]["tickers"],
             "regimes_tested": len(results),
-            "mean_equity_df": mean_equity_df,
-            "regime_equity_curves": regime_equity_curves,
+            "equity_curve_df": equity_curve_df,
+        }
+
+    def run_benchmark_multi_window(self, windows_str: str) -> Dict:
+        """Buy-and-hold benchmark metrics on the same concatenated regime path."""
+        pairs = [w.strip().split(":") for w in windows_str.split(",") if ":" in w]
+        curves = []
+        for start_d, end_d in pairs:
+            spy_df = self._download_single(
+                self.benchmark_ticker, start_d.strip(), end_d.strip()
+            )
+            spy_open = float(spy_df["Open"].iloc[0])
+            shares = self.initial_cash / (spy_open * (1.0 + self.commission_rate))
+            curves.append(shares * spy_df["Close"])
+
+        combined = chain_equity_curves(curves, self.initial_cash)
+        metrics = self._calc_metrics(combined)
+        return {
+            "sharpe": metrics["sharpe"],
+            "total_return_pct": metrics["total_return_pct"],
+            "max_drawdown_pct": metrics["max_drawdown_pct"],
+            "final_equity": metrics["final_equity"],
+            "regimes": len(pairs),
         }
 
 

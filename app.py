@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import tempfile
@@ -24,29 +25,9 @@ os.makedirs(SUBMISSIONS_DIR, exist_ok=True)
 
 @st.cache_data(ttl=3600)
 def get_oos_spy_benchmark(windows_str: str):
-    """Fetches and caches average SPY Buy-and-Hold metrics across all secret OOS regimes."""
+    """Fetches and caches SPY buy-and-hold metrics on the concatenated regimes."""
     bt = Backtester()
-    pairs = [w.strip().split(":") for w in windows_str.split(",") if ":" in w]
-    metrics_list = []
-
-    for start_d, end_d in pairs:
-        spy_df = bt._download_single("SPY", start_d.strip(), end_d.strip())
-        spy_open = float(spy_df["Open"].iloc[0])
-        shares = bt.initial_cash / (spy_open * (1.0 + bt.commission_rate))
-        eq_series = shares * spy_df["Close"]
-        metrics_list.append(bt._calc_metrics(eq_series))
-
-    return {
-        "sharpe": float(sum(m["sharpe"] for m in metrics_list) / len(metrics_list)),
-        "total_return_pct": float(
-            sum(m["total_return_pct"] for m in metrics_list) / len(metrics_list)
-        ),
-        "max_drawdown_pct": float(min(m["max_drawdown_pct"] for m in metrics_list)),
-        "final_equity": float(
-            sum(m["final_equity"] for m in metrics_list) / len(metrics_list)
-        ),
-        "regimes": len(metrics_list),
-    }
+    return bt.run_benchmark_multi_window(windows_str)
 
 
 def init_db():
@@ -93,17 +74,35 @@ def init_db():
             ON leaderboard(member_name, strategy_name)
             """)
 
+        # Store the precomputed sequential equity curve so the leaderboard can
+        # display it immediately without re-running any strategy.
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(leaderboard)")]
+        if "equity_curve" not in columns:
+            conn.execute("ALTER TABLE leaderboard ADD COLUMN equity_curve TEXT")
+
+
+def serialize_equity_curve(curve_df: pd.DataFrame) -> str:
+    return json.dumps(
+        {
+            "strategy": [round(float(v), 4) for v in curve_df["Strategy"]],
+            "spy": [round(float(v), 4) for v in curve_df["SPY_Benchmark"]],
+        },
+        separators=(",", ":"),
+    )
+
 
 def upsert_submission(member_name, strategy_name, res):
     excess_sharpe = res["sharpe"] - res["spy_sharpe"]
+    equity_curve = serialize_equity_curve(res["equity_curve_df"])
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
             INSERT INTO leaderboard (
                 member_name, strategy_name, sharpe, excess_sharpe,
-                total_return_pct, alpha_pct, beta, max_drawdown_pct, submitted_at
+                total_return_pct, alpha_pct, beta, max_drawdown_pct,
+                submitted_at, equity_curve
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(member_name, strategy_name) DO UPDATE SET
                 strategy_name=excluded.strategy_name,
                 sharpe=excluded.sharpe,
@@ -112,7 +111,8 @@ def upsert_submission(member_name, strategy_name, res):
                 alpha_pct=excluded.alpha_pct,
                 beta=excluded.beta,
                 max_drawdown_pct=excluded.max_drawdown_pct,
-                submitted_at=excluded.submitted_at
+                submitted_at=excluded.submitted_at,
+                equity_curve=excluded.equity_curve
             """,
             (
                 member_name,
@@ -124,6 +124,7 @@ def upsert_submission(member_name, strategy_name, res):
                 round(res["beta"], 2),
                 round(res["max_drawdown_pct"], 2),
                 datetime.now().strftime("%Y-%m-%d %H:%M UTC"),
+                equity_curve,
             ),
         )
 
@@ -168,33 +169,27 @@ def get_leaderboard() -> pd.DataFrame:
     return df
 
 
-def find_strategy_file(member_name: str, strategy_name: str):
-    """Locate the uploaded .py file behind a leaderboard entry."""
-    for fname in sorted(os.listdir(SUBMISSIONS_DIR)):
-        if not fname.endswith(".py"):
-            continue
-        fpath = os.path.join(SUBMISSIONS_DIR, fname)
+def get_equity_curves() -> dict:
+    """Load precomputed sequential equity curves keyed by (member, strategy)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT member_name, strategy_name, equity_curve
+            FROM leaderboard
+            WHERE equity_curve IS NOT NULL
+            """
+        ).fetchall()
+
+    curves = {}
+    for member, strategy, payload in rows:
         try:
-            member, strategy = get_strategy_metadata(fpath)
-        except Exception:
+            data = json.loads(payload)
+            curves[(member, strategy)] = pd.DataFrame(
+                {"Strategy": data["strategy"], "SPY_Benchmark": data["spy"]}
+            )
+        except (TypeError, ValueError, KeyError):
             continue
-        if member == member_name and strategy == strategy_name:
-            return fpath
-    return None
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_strategy_equity_curves(filepath: str, windows_str: str, file_mtime: float):
-    """Re-runs a submitted strategy over the hidden regimes and returns base-100 curves.
-
-    `file_mtime` is only used to invalidate the cache when a strategy file changes.
-    """
-    bt = Backtester(anonymize=True)
-    res = bt.run_multi_window(filepath, windows_str)
-    return {
-        "mean_equity_df": res["mean_equity_df"],
-        "regime_equity_curves": res["regime_equity_curves"],
-    }
+    return curves
 
 
 init_db()
@@ -209,7 +204,7 @@ leaderboard_tab, backtester_tab, submission_tab, guide_tab, admin_tab = st.tabs(
 with leaderboard_tab:
     st.subheader("Official Rankings")
     st.caption(
-        "Evaluated across undisclosed multi-regime market windows | Ranked by Mean Annualized Sharpe Ratio (10 bps fee/slippage, 4% RF rate)"
+        "Evaluated across undisclosed multi-regime market windows | Ranked by Annualized Sharpe Ratio on the concatenated equity curve (10 bps fee/slippage, 4% RF rate)"
     )
 
     # Pinned SPY Benchmark Reference Bar
@@ -217,10 +212,10 @@ with leaderboard_tab:
         spy_bench = get_oos_spy_benchmark(SECRET_OOS_WINDOWS)
         st.markdown(f"##### Benchmark Reference: `SPY` Buy-and-Hold")
         b1, b2, b3, b4 = st.columns(4)
-        b1.metric("SPY Mean Sharpe", f"{spy_bench['sharpe']:.3f}")
-        b2.metric("SPY Mean Return", f"{spy_bench['total_return_pct']:.2f}%")
-        b3.metric("SPY Worst Drawdown", f"{spy_bench['max_drawdown_pct']:.2f}%")
-        b4.metric("SPY Avg Final Equity ($100k)", f"${spy_bench['final_equity']:,.2f}")
+        b1.metric("SPY Sharpe", f"{spy_bench['sharpe']:.3f}")
+        b2.metric("SPY Total Return", f"{spy_bench['total_return_pct']:.2f}%")
+        b3.metric("SPY Max Drawdown", f"{spy_bench['max_drawdown_pct']:.2f}%")
+        b4.metric("SPY Final Equity ($100k)", f"${spy_bench['final_equity']:,.2f}")
     except Exception as e:
         st.warning(f"Could not load SPY benchmark banner: {e}")
 
@@ -233,13 +228,14 @@ with leaderboard_tab:
 
         st.markdown("##### Equity Curve Comparison")
         st.caption(
-            "Re-runs the selected submissions over the hidden evaluation regimes and plots "
-            "base-100 equity curves. Regime averaging is done bar-by-bar, so calendar dates stay hidden."
+            "Equity paths are precomputed when a strategy is scored and loaded from the "
+            "database. The hidden regimes are stitched together in order as one continuous "
+            "portfolio, starting at $100,000. SPY buy-and-hold is always included."
         )
 
         options = {
-            f"{row['Member']} — {row['Strategy']}": (row["Member"], row["Strategy"])
-            for _, row in lb_df.iterrows()
+                    f"{row['Member']} — {row['Strategy']}": (row["Member"], row["Strategy"])
+                    for _, row in lb_df.iterrows()
         }
         chosen_labels = st.multiselect(
             "Strategies to compare",
@@ -247,90 +243,47 @@ with leaderboard_tab:
             default=list(options)[: min(3, len(options))],
             key="lb_compare_select",
         )
-        c_spy, c_view = st.columns(2)
-        include_spy = c_spy.checkbox(
-            "Include SPY buy-and-hold benchmark", value=True, key="lb_compare_spy"
-        )
-        view = c_view.radio(
-            "Curve view",
-            ["Average across regimes", "Single regime"],
-            horizontal=True,
-            key="lb_compare_view",
-        )
 
-        if st.button("Generate Equity Curves", key="lb_compare_btn"):
-            if not chosen_labels:
-                st.warning("Select at least one strategy to compare.")
+        stored_curves = get_equity_curves()
+        chart_df = pd.DataFrame()
+        spy_series = None
+        missing_curves = []
+
+
+        for label in chosen_labels:
+            member, strategy = options[label]
+            curve = stored_curves.get((member, strategy))
+            if curve is None:
+                missing_curves.append(label)
+                continue
+            chart_df[label] = curve["Strategy"]
+            if spy_series is None:
+                spy_series = curve["SPY_Benchmark"]
+
+        if spy_series is not None:
+            chart_df["SPY Buy-and-Hold"] = spy_series
+
+        if chart_df.empty:
+            if stored_curves:
+                st.info("Select at least one strategy to compare.")
             else:
-                mean_cols = {}
-                spy_mean = None
-                regime_frames = {}
-                errors = []
-                progress = st.progress(0.0)
-                for idx, label in enumerate(chosen_labels):
-                    member, strategy = options[label]
-                    fpath = find_strategy_file(member, strategy)
-                    if fpath is None:
-                        errors.append(f"{label}: uploaded strategy file not found.")
-                        continue
-                    try:
-                        data = get_strategy_equity_curves(
-                            fpath, SECRET_OOS_WINDOWS, os.path.getmtime(fpath)
-                        )
-                    except Exception as e:
-                        errors.append(f"{label}: {e}")
-                        continue
-
-                    mean_cols[label] = data["mean_equity_df"]["Strategy"]
-                    if spy_mean is None:
-                        spy_mean = data["mean_equity_df"]["SPY_Benchmark"]
-                    for regime_label, curve in data["regime_equity_curves"].items():
-                        regime_frames.setdefault(regime_label, {})
-                        regime_frames[regime_label][label] = curve["Strategy"]
-                        regime_frames[regime_label].setdefault(
-                            "SPY Buy-and-Hold", curve["SPY_Benchmark"]
-                        )
-                    progress.progress((idx + 1) / len(chosen_labels))
-                progress.empty()
-
-                for err in errors:
-                    st.error(err)
-
-                st.session_state["lb_equity_comparison"] = {
-                    "mean": pd.DataFrame(mean_cols),
-                    "spy_mean": spy_mean,
-                    "regimes": {
-                        name: pd.DataFrame(frame)
-                        for name, frame in regime_frames.items()
-                    },
-                    "labels": [label for label in chosen_labels if label in mean_cols],
-                }
-
-        comparison = st.session_state.get("lb_equity_comparison")
-        if comparison and not comparison["mean"].empty:
-            picked_regime = None
-            if view == "Single regime" and comparison["regimes"]:
-                picked_regime = st.selectbox(
-                    "Hidden regime", list(comparison["regimes"]), key="lb_regime_pick"
+                st.info(
+                    "No stored equity curves yet. An organizer can run "
+                    "**Re-Score Entire Leaderboard** from the Admin tab to populate them."
                 )
-                chart_df = comparison["regimes"][picked_regime].copy()
-            else:
-                chart_df = comparison["mean"].copy()
-                if comparison["spy_mean"] is not None:
-                    chart_df["SPY Buy-and-Hold"] = comparison["spy_mean"]
-
-            if not include_spy and "SPY Buy-and-Hold" in chart_df.columns:
-                chart_df = chart_df.drop(columns=["SPY Buy-and-Hold"])
-
-            st.markdown("#### Portfolio Equity (Base 100)")
-            caption = f"Showing: {', '.join(comparison['labels'])}"
-            if picked_regime:
-                caption += f" | {picked_regime}"
-            st.caption(caption)
+        else:
+            st.markdown("#### Portfolio Equity")
             st.line_chart(chart_df, height=420, width="stretch")
             st.caption(
-                "Each series starts at 100. The average view averages every trading-day "
-                "bar across the hidden regimes; shorter regimes contribute until their last bar."
+                "Regimes are concatenated in evaluation order, so each curve represents "
+                "one continuous portfolio rather than an average across regimes."
+            )
+
+        if missing_curves:
+            st.warning(
+                "No stored equity curve for: "
+                + ", ".join(missing_curves)
+                + ". Re-score from the Admin tab to populate it."
             )
 
 
@@ -490,10 +443,11 @@ with submission_tab:
                             diff = res["sharpe"] - res["spy_sharpe"]
                             st.session_state["submission_success"] = (
                                 f"✅ Submitted across **{res['regimes_tested']}** hidden regimes! "
-                                f"Mean OOS Sharpe: **{res['sharpe']:.3f}** ({diff:+.3f} vs SPY) | "
-                                f"Worst Regime Sharpe: **{res['min_regime_sharpe']:.3f}** | "
-                                f"Mean Alpha: **{res['alpha_pct']:+.2f}%** | "
-                                f"Mean Beta: **{res['beta']:.2f}**. "
+                                f"Sharpe: **{res['sharpe']:.3f}** ({diff:+.3f} vs SPY) | "
+                                f"Total Return: **{res['total_return_pct']:+.2f}%** | "
+                                f"Max Drawdown: **{res['max_drawdown_pct']:.2f}%** | "
+                                f"Alpha: **{res['alpha_pct']:+.2f}%** | "
+                                f"Beta: **{res['beta']:.2f}**. "
                                 "Check the Leaderboard tab to see your submission."
                             )
                             st.rerun()
@@ -542,8 +496,8 @@ with guide_tab:
     ### Rules for Fair Comparison
     1. **Zero Lookahead Bias:** Your `Trader.run(state)` method is called sequentially day-by-day. `state.history[ticker]` contains OHLCV bars strictly up to current bar $t$.
     2. **Execution at Next Open:** Orders returned at bar $t$ are filled at the **Open price of bar $t+1$** with **10 bps (0.10%)** slippage/commission deducted.
-    3. **SPY Benchmark:** `SPY` Buy-and-Hold is initialized with $100,000 at the first day's Open (less the 10 bps fee) and held through the end of the evaluation window.
-    4. **Ranking Metric:** Annualized Daily Sharpe Ratio ($R_f = 4\\%$, $\\sqrt{252}$ scaling) over the official Out-Of-Sample date window, alongside CAPM Alpha ($\\alpha$) and Beta ($\\beta$) relative to `SPY`.
+    3. **SPY Benchmark:** `SPY` Buy-and-Hold is initialized with $100,000 at the first day's Open (less the 10 bps fee) and held through the end of each evaluation window.
+    4. **Ranking Metric:** Annualized Daily Sharpe Ratio ($R_f = 4\\%$, $\\sqrt{252}$ scaling) computed on the **concatenated** Out-Of-Sample equity curve, alongside CAPM Alpha ($\\alpha$) and Beta ($\\beta$) relative to `SPY`. Regimes are chained in order, with each regime's ending equity carried into the next.
     """)
     st.code(sample_code, language="python")
 
