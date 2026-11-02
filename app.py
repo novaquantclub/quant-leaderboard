@@ -51,20 +51,51 @@ def get_oos_spy_benchmark(windows_str: str):
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS leaderboard (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                member_name TEXT UNIQUE,
-                strategy_name TEXT,
-                sharpe REAL,
-                excess_sharpe REAL,
-                total_return_pct REAL,
-                alpha_pct REAL,
-                beta REAL,
-                max_drawdown_pct REAL,
-                submitted_at TEXT
+        table_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'leaderboard'"
+        ).fetchone()
+        if table_sql and "member_name TEXT UNIQUE" in table_sql[0]:
+            conn.execute("""
+                CREATE TABLE leaderboard_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    member_name TEXT NOT NULL,
+                    strategy_name TEXT NOT NULL,
+                    sharpe REAL,
+                    excess_sharpe REAL,
+                    total_return_pct REAL,
+                    alpha_pct REAL,
+                    beta REAL,
+                    max_drawdown_pct REAL,
+                    submitted_at TEXT
+                )
+                """)
+            conn.execute(
+                "INSERT INTO leaderboard_new SELECT * FROM leaderboard"
             )
-            """)
+            conn.execute("DROP TABLE leaderboard")
+            conn.execute("ALTER TABLE leaderboard_new RENAME TO leaderboard")
+        else:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS leaderboard (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    member_name TEXT NOT NULL,
+                    strategy_name TEXT NOT NULL,
+                    sharpe REAL,
+                    excess_sharpe REAL,
+                    total_return_pct REAL,
+                    alpha_pct REAL,
+                    beta REAL,
+                    max_drawdown_pct REAL,
+                    submitted_at TEXT
+                )
+                """)
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_leaderboard_member_strategy
+            ON leaderboard(member_name, strategy_name)
+            """
+        )
 
 
 def upsert_submission(member_name, strategy_name, res):
@@ -77,7 +108,7 @@ def upsert_submission(member_name, strategy_name, res):
                 total_return_pct, alpha_pct, beta, max_drawdown_pct, submitted_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(member_name) DO UPDATE SET
+            ON CONFLICT(member_name, strategy_name) DO UPDATE SET
                 strategy_name=excluded.strategy_name,
                 sharpe=excluded.sharpe,
                 excess_sharpe=excluded.excess_sharpe,
@@ -290,7 +321,8 @@ if active_section == "Submit to Leaderboard":
 
                     clean_member, clean_strat = get_strategy_metadata(tmp_path)
                     safe_name = "".join(
-                        c for c in clean_strat if c.isalnum() or c in ("_", "-")
+                        c for c in f"{clean_member}_{clean_strat}"
+                        if c.isalnum() or c in ("_", "-")
                     )
                     if not safe_name:
                         raise ValueError(
@@ -299,8 +331,12 @@ if active_section == "Submit to Leaderboard":
 
                     with sqlite3.connect(DB_PATH) as conn:
                         row = conn.execute(
-                            "SELECT submitted_at FROM leaderboard WHERE member_name = ?",
-                            (clean_member,),
+                            """
+                            SELECT submitted_at
+                            FROM leaderboard
+                            WHERE member_name = ? AND strategy_name = ?
+                            """,
+                            (clean_member, clean_strat),
                         ).fetchone()
 
                     cooldown_blocked = False
@@ -308,7 +344,7 @@ if active_section == "Submit to Leaderboard":
                         try:
                             last_sub = datetime.strptime(row[0], "%Y-%m-%d %H:%M UTC")
                             hours_since = (
-                                datetime.utcnow() - last_sub
+                                datetime.now() - last_sub
                             ).total_seconds() / 3600.0
                             if hours_since < COOLDOWN_HOURS:
                                 remaining = COOLDOWN_HOURS - hours_since
@@ -345,7 +381,7 @@ if active_section == "Submit to Leaderboard":
                             st.session_state["redirect_to_leaderboard"] = True
                             st.rerun()
                 except Exception as e:
-                    if saved_path and os.path.exists(saved_path) and not row:
+                    if saved_path and os.path.exists(saved_path):
                         os.remove(saved_path)
                     st.error(f"Evaluation failed: {e}")
                 finally:
@@ -473,11 +509,14 @@ if active_section == "Admin":
             if st.button("Delete Selected Strategy", key="admin_delete"):
                 delete_path = os.path.join(SUBMISSIONS_DIR, delete_file)
                 try:
-                    member, _ = get_strategy_metadata(delete_path)
+                    member, strategy = get_strategy_metadata(delete_path)
                     with sqlite3.connect(DB_PATH) as conn:
                         conn.execute(
-                            "DELETE FROM leaderboard WHERE member_name = ?",
-                            (member,),
+                            """
+                            DELETE FROM leaderboard
+                            WHERE member_name = ? AND strategy_name = ?
+                            """,
+                            (member, strategy),
                         )
                     os.remove(delete_path)
                     st.success(f"Deleted {delete_file} and its leaderboard entry.")
