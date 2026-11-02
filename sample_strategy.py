@@ -25,7 +25,7 @@ class Trader:
 
         Available state attributes:
         state.step              # Anonymized integer bar index (0, 1, 2, ...)
-        state.history           # Indexed 0..step, prices normalized to base 100.0
+        state.history           # Indexed -100..step, prices normalized to base 100.0
         state.positions         # Current units held per ticker
         state.cash              # Current cash available for trading
         state.portfolio_value   # Current total portfolio value (cash + positions)

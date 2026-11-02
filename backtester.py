@@ -7,6 +7,15 @@ import pandas as pd
 import yfinance as yf
 
 
+WARMUP_BARS = 100
+READ_ONLY_SYMBOL_MARKERS = ("^", "=")
+
+
+def is_read_only_symbol(symbol: str) -> bool:
+    """Return whether a symbol may provide signals but cannot be traded."""
+    return any(marker in symbol for marker in READ_ONLY_SYMBOL_MARKERS)
+
+
 def chain_equity_curves(curves: List[pd.Series], initial_value: float) -> pd.Series:
     """Concatenate per-regime equity paths, carrying the ending level forward."""
     parts = []
@@ -21,7 +30,7 @@ def chain_equity_curves(curves: List[pd.Series], initial_value: float) -> pd.Ser
 @dataclass
 class TradingState:
     step: int  # Anonymized integer bar index (0, 1, 2, ...)
-    history: Dict[str, pd.DataFrame]  # Indexed 0..step, prices normalized to base 100.0
+    history: Dict[str, pd.DataFrame]  # Indexed -100..step, prices normalized to base 100.0
     positions: Dict[str, float]  # Current units held per ticker
     cash: float
     portfolio_value: float
@@ -90,25 +99,60 @@ class Backtester:
 
     def run(self, trader, start_date: str, end_date: str) -> Dict:
         tickers = [t.strip().upper() for t in getattr(trader, "tickers", [])]
-        raw_data = self.fetch_data(tickers, start_date, end_date)
+        if not tickers or len(tickers) > 20:
+            raise ValueError(
+                "Strategy must declare between 1 and 20 valid yfinance tickers."
+            )
+        evaluation_start = pd.Timestamp(start_date)
+        evaluation_end = pd.Timestamp(end_date)
+        buffer_start = evaluation_start - pd.Timedelta(days=365)
+        raw_data = {
+            ticker: self._download_single(
+                ticker, buffer_start.strftime("%Y-%m-%d"), end_date
+            )
+            for ticker in tickers
+        }
         spy_df = self._download_single(self.benchmark_ticker, start_date, end_date)
 
-        all_dates = sorted(list(set().union(*(df.index for df in raw_data.values()))))
-        if len(all_dates) < 10:
+        available_dates = sorted(
+            list(set().union(*(df.index for df in raw_data.values())))
+        )
+        evaluation_dates = [
+            date for date in available_dates if evaluation_start <= date < evaluation_end
+        ]
+        warmup_dates = [
+            date for date in available_dates if date < evaluation_start
+        ][-WARMUP_BARS:]
+        if len(evaluation_dates) < 10:
             raise ValueError("Insufficient trading days in selected window.")
+        if len(warmup_dates) < WARMUP_BARS:
+            raise ValueError(
+                f"Insufficient history for the {WARMUP_BARS}-bar warm-up buffer."
+            )
+        all_dates = warmup_dates + evaluation_dates
+        warmup_end_index = len(warmup_dates)
 
-        # Reindex and normalize each ticker to base 100 at bar 0 so strategies cannot fingerprint price levels
+        # Normalize evaluation bar 0 to 100 while retaining prior bars for warm-up.
         data = {}
         for t, df in raw_data.items():
             aligned = df.reindex(all_dates).ffill().bfill()
             if self.anonymize:
-                base_price = float(aligned["Open"].iloc[0])
-                base_vol = float(aligned["Volume"].iloc[:5].mean()) or 1.0
+                base_price = float(aligned["Open"].iloc[warmup_end_index])
+                base_vol = (
+                    float(
+                        aligned["Volume"]
+                        .iloc[warmup_end_index : warmup_end_index + 5]
+                        .mean()
+                    )
+                    or 1.0
+                )
                 norm_df = aligned.copy()
                 for col in ["Open", "High", "Low", "Close"]:
                     norm_df[col] = (aligned[col] / base_price) * 100.0
                 norm_df["Volume"] = aligned["Volume"] / base_vol
-                norm_df.index = pd.RangeIndex(len(norm_df))
+                norm_df.index = pd.RangeIndex(
+                    -warmup_end_index, len(norm_df) - warmup_end_index
+                )
                 data[t] = norm_df
             else:
                 data[t] = aligned
@@ -119,12 +163,12 @@ class Backtester:
         equity_curve = []
         trader_data: str = ""
 
-        for step_idx, dt in enumerate(all_dates):
-            idx_key = step_idx if self.anonymize else dt
+        for step_idx, dt in enumerate(evaluation_dates):
+            data_index = warmup_end_index + step_idx
 
             # 1. Execute orders from previous bar at today's OPEN price
             for t, qty in pending_orders.items():
-                open_price = float(data[t].loc[idx_key, "Open"])
+                open_price = float(data[t].iloc[data_index]["Open"])
                 if open_price <= 0 or np.isnan(open_price) or qty == 0:
                     continue
                 if qty > 0:
@@ -144,7 +188,7 @@ class Backtester:
             port_val = cash
             current_history = {}
             for t in tickers:
-                hist_slice = data[t].iloc[: step_idx + 1]
+                hist_slice = data[t].iloc[: data_index + 1]
                 current_history[t] = hist_slice
                 close_price = float(hist_slice["Close"].iloc[-1])
                 port_val += positions[t] * close_price
@@ -171,11 +215,15 @@ class Backtester:
                 orders = result
 
             if isinstance(orders, dict):
-                pending_orders = {
-                    str(k).upper(): float(v)
-                    for k, v in orders.items()
-                    if str(k).upper() in tickers
-                }
+                pending_orders = {}
+                for key, value in orders.items():
+                    symbol = str(key).upper()
+                    quantity = float(value)
+                    if symbol not in tickers:
+                        continue
+                    if quantity != 0 and is_read_only_symbol(symbol):
+                        continue
+                    pending_orders[symbol] = quantity
 
         eq_df = pd.DataFrame(equity_curve).set_index("Date")
 

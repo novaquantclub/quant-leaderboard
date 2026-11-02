@@ -71,6 +71,13 @@ class Trader:
 - `run(state)` is called once per trading day.
 - Return a dictionary mapping ticker symbols to share quantities. Positive
   quantities buy; negative quantities sell.
+- Symbols containing `^` or `=` are read-only macro signals. They are available
+  in `state.history`, but all non-zero orders for them are ignored.
+- At evaluation `step == 0`, `state.history` already contains the prior 100
+  trading bars plus the current bar. These warm-up bars are provided for
+  indicators but are not scored or traded. In anonymized mode, the history
+  index runs from `-100` through the current `step`, and evaluation bar `0`
+  has an open price of 100.
 - Orders returned at the current bar are filled at the **next bar's open**.
 - Orders are subject to available cash, current positions, and the 10 bps fee.
 - Strategies may optionally return `(orders, trader_data)`. `trader_data` must
@@ -120,11 +127,16 @@ subject to the configured submission cooldown.
 
 1. **No lookahead bias:** `state.history` contains only data available through
    the current bar.
-2. **Next-open execution:** orders are filled at the following day's open.
-3. **Transaction costs apply:** every trade includes 10 bps commission/slippage.
-4. **Long-only positions:** sell orders cannot exceed the current position.
-5. **No date leakage:** official timestamps and prices are anonymized.
-6. **Benchmark consistency:** every score is compared with SPY under the same
+2. **Warm-up history:** each evaluation window starts at `step == 0` with 100
+   prior trading bars in `state.history`; warm-up bars do not affect scoring or
+   portfolio execution.
+3. **Next-open execution:** orders are filled at the following day's open.
+4. **Transaction costs apply:** every trade includes 10 bps commission/slippage.
+5. **Read-only macro symbols:** symbols containing `^` or `=` may be used for
+   signals but cannot be traded.
+6. **Long-only positions:** sell orders cannot exceed the current position.
+7. **No date leakage:** official timestamps and prices are anonymized.
+8. **Benchmark consistency:** every score is compared with SPY under the same
    starting capital and fee assumptions.
 
 ## Configuration

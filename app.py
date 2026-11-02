@@ -540,9 +540,11 @@ with guide_tab:
 
     ### Rules for Fair Comparison
     1. **Zero Lookahead Bias:** Your `Trader.run(state)` method is called sequentially day-by-day. `state.history[ticker]` contains OHLCV bars strictly up to current bar $t$.
-    2. **Execution at Next Open:** Orders returned at bar $t$ are filled at the **Open price of bar $t+1$** with **10 bps (0.10%)** slippage/commission deducted.
-    3. **SPY Benchmark:** `SPY` Buy-and-Hold is initialized with $100,000 at the first day's Open (less the 10 bps fee) and held through the end of each evaluation window.
-    4. **Ranking Metric:** Annualized Daily Sharpe Ratio ($R_f = 4\\%$, $\\sqrt{252}$ scaling) computed on the **concatenated** Out-Of-Sample equity curve, alongside CAPM Alpha ($\\alpha$) and Beta ($\\beta$) relative to `SPY`. Regimes are chained in order, with each regime's ending equity carried into the next.
+    2. **Warm-up history:** At `step == 0`, `state.history` contains the prior 100 trading bars plus the current bar. In anonymized mode, history is indexed from `-100` through the current step, and evaluation bar `0` has an open price of 100. These bars are available for indicators but are not traded or scored.
+    3. **Execution at Next Open:** Orders returned at bar $t$ are filled at the **Open price of bar $t+1$** with **10 bps (0.10%)** slippage/commission deducted.
+    4. **Read-only macro symbols:** Symbols containing `^` or `=` can be used in `state.history` as signals, but non-zero orders for them are ignored.
+    5. **SPY Benchmark:** `SPY` Buy-and-Hold is initialized with $100,000 at the first day's Open (less the 10 bps fee) and held through the end of each evaluation window.
+    6. **Ranking Metric:** Annualized Daily Sharpe Ratio ($R_f = 4\\%$, $\\sqrt{252}$ scaling) computed on the **concatenated** Out-Of-Sample equity curve, alongside CAPM Alpha ($\\alpha$) and Beta ($\\beta$) relative to `SPY`. Regimes are chained in order, with each regime's ending equity carried into the next.
     """)
     st.code(sample_code, language="python")
 
