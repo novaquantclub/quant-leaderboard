@@ -14,7 +14,7 @@ SECRET_OOS_WINDOWS = os.getenv(
     "SECRET_OOS_WINDOWS",
     "2018-01-01:2018-12-31,2019-01-01:2019-12-31",
 )
-COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "6"))
+COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "0"))
 SUBMISSIONS_DIR = "data/submissions"
 DB_PATH = os.getenv("DB_PATH", "data/leaderboard.db")
 
@@ -153,7 +153,7 @@ sections = [
     "Admin",
 ]
 if st.session_state.pop("redirect_to_leaderboard", False):
-    st.session_state["section_selector"] = "🏆 Leaderboard"
+    st.session_state["section_selector"] = "Leaderboard"
 active_section = st.radio(
     "Section",
     sections,
@@ -163,7 +163,7 @@ active_section = st.radio(
 )
 
 # --- TAB 1: LEADERBOARD ---
-if active_section == "🏆 Leaderboard":
+if active_section == "Leaderboard":
     st.subheader("Official Out-Of-Sample Rankings")
     st.caption(
         "Evaluated across undisclosed multi-regime market windows | Ranked by Mean Annualized Sharpe Ratio (10 bps fee/slippage, 4% RF rate)"
@@ -191,7 +191,7 @@ if active_section == "🏆 Leaderboard":
         st.dataframe(lb_df, width="stretch")
 
 # --- TAB 2: WEB SANDBOX BACKTESTER ---
-if active_section == "🧪 Backtester":
+if active_section == "Backtester":
     st.subheader("Interactive In-Sample Web Backtester (vs. SPY Buy & Hold)")
     st.write(
         "Test your `.py` strategy file on historical In-Sample dates and compare your equity curve directly against `SPY`."
@@ -259,7 +259,7 @@ if active_section == "🧪 Backtester":
                 st.error(f"Backtest Error: {e}")
 
 # --- TAB 3: OFFICIAL SUBMISSION ---
-if active_section == "🚀 Submit to Leaderboard":
+if active_section == "Submit to Leaderboard":
     st.subheader("Submit Strategy for Official OOS Evaluation")
     st.caption(
         f"Strategies are evaluated across multiple undisclosed historical market regimes "
@@ -352,7 +352,7 @@ if active_section == "🚀 Submit to Leaderboard":
                     if tmp_path and os.path.exists(tmp_path):
                         os.remove(tmp_path)
 # --- TAB 4: LOCAL SDK & RULES ---
-if active_section == "📖 Guide":
+if active_section == "Guide":
     st.subheader("Download Local Backtester & Strategy Template")
     st.write(
         "Develop locally using the exact same execution engine and SPY benchmark comparison running on this server."
@@ -393,7 +393,7 @@ if active_section == "📖 Guide":
     """)
     st.code(sample_code, language="python")
 
-if active_section == "🔒 Admin":
+if active_section == "Admin":
     st.subheader("Organizer Administration")
     admin_pw = st.text_input("Admin Password", type="password", key="admin_password")
 
