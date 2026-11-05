@@ -1,20 +1,28 @@
+import hashlib
 import json
 import os
 import sqlite3
 import tempfile
+from contextlib import closing
 from datetime import datetime
 import streamlit as st
 import pandas as pd
-from backtester import Backtester, load_trader_from_file
+from backtester import (
+    Backtester,
+    OOS_JITTER_COPIES,
+    OOS_JITTER_SCALE,
+    load_trader_from_file,
+)
 
 # --- Configuration & Environment Variables ---
 CLUB_PASSWORD = os.getenv("CLUB_PASSWORD", "password")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "password")
-# Secret comma-separated regimes (Bull, Bear, Volatile) — NEVER shown in the UI
+# Organizer-only historical source windows used to generate jittered copies.
 SECRET_OOS_WINDOWS = os.getenv(
     "SECRET_OOS_WINDOWS",
     "2018-01-01:2018-12-31,2019-01-01:2019-12-31",
 )
+OOS_SEED = int(os.getenv("SECRET_OOS_SEED", "20261105"))
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "0"))
 SUBMISSIONS_DIR = "data/submissions"
 DB_PATH = os.getenv("DB_PATH", "data/leaderboard.db")
@@ -24,14 +32,23 @@ os.makedirs(SUBMISSIONS_DIR, exist_ok=True)
 
 
 @st.cache_data(ttl=3600)
-def get_oos_spy_benchmark(windows_str: str):
-    """Fetches and caches SPY buy-and-hold metrics on the concatenated regimes."""
-    bt = Backtester()
-    return bt.run_benchmark_multi_window(windows_str)
+def get_oos_spy_benchmark(windows_str: str, seed: int):
+    return Backtester().run_benchmark_jittered(windows_str, seed)
+
+
+def evaluation_id(windows: str, seed: int) -> str:
+    source_windows = sorted(
+        ":".join(part.strip() for part in window.split(":"))
+        for window in windows.split(",") if window.strip()
+    )
+    settings = [
+        "historical-jitter-v1", source_windows, seed, OOS_JITTER_COPIES, OOS_JITTER_SCALE,
+    ]
+    return hashlib.sha256(json.dumps(settings).encode()).hexdigest()
 
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS app_settings (
@@ -82,15 +99,17 @@ def init_db():
             ON leaderboard(member_name, strategy_name)
             """)
 
-        # Store the precomputed sequential equity curve so the leaderboard can
+        # Store the precomputed equity curve so the leaderboard can
         # display it immediately without re-running any strategy.
         columns = [row[1] for row in conn.execute("PRAGMA table_info(leaderboard)")]
         if "equity_curve" not in columns:
             conn.execute("ALTER TABLE leaderboard ADD COLUMN equity_curve TEXT")
+        if "evaluation_id" not in columns:
+            conn.execute("ALTER TABLE leaderboard ADD COLUMN evaluation_id TEXT")
 
 
 def get_evaluation_windows() -> str:
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         row = conn.execute(
             "SELECT value FROM app_settings WHERE key = 'evaluation_windows'"
         ).fetchone()
@@ -98,7 +117,7 @@ def get_evaluation_windows() -> str:
 
 
 def save_evaluation_windows(windows: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute(
             """
             INSERT INTO app_settings (key, value)
@@ -114,6 +133,7 @@ def validate_evaluation_windows(windows: str) -> str | None:
     if not entries:
         return "Please specify at least one evaluation window."
 
+    intervals = []
     for entry in entries:
         parts = [part.strip() for part in entry.split(":")]
         if len(parts) != 2:
@@ -123,8 +143,14 @@ def validate_evaluation_windows(windows: str) -> str | None:
             end = datetime.strptime(parts[1], "%Y-%m-%d")
         except ValueError:
             return f"Invalid window `{entry}`. Use YYYY-MM-DD:YYYY-MM-DD."
+        if [start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")] != parts:
+            return f"Invalid window {entry}. Use YYYY-MM-DD:YYYY-MM-DD."
         if start >= end:
             return f"Invalid window `{entry}`. The end date must be after the start date."
+        intervals.append((start, end))
+    intervals.sort()
+    if any(end > next_start for (_, end), (next_start, _) in zip(intervals, intervals[1:])):
+        return "Historical source windows must not overlap."
     return None
 
 
@@ -138,18 +164,18 @@ def serialize_equity_curve(curve_df: pd.DataFrame) -> str:
     )
 
 
-def upsert_submission(member_name, strategy_name, res):
+def upsert_submission(member_name, strategy_name, res, score_id):
     excess_sharpe = res["sharpe"] - res["spy_sharpe"]
     equity_curve = serialize_equity_curve(res["equity_curve_df"])
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute(
             """
             INSERT INTO leaderboard (
                 member_name, strategy_name, sharpe, excess_sharpe,
                 total_return_pct, alpha_pct, beta, max_drawdown_pct,
-                submitted_at, equity_curve
+                submitted_at, equity_curve, evaluation_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(member_name, strategy_name) DO UPDATE SET
                 strategy_name=excluded.strategy_name,
                 sharpe=excluded.sharpe,
@@ -159,7 +185,8 @@ def upsert_submission(member_name, strategy_name, res):
                 beta=excluded.beta,
                 max_drawdown_pct=excluded.max_drawdown_pct,
                 submitted_at=excluded.submitted_at,
-                equity_curve=excluded.equity_curve
+                equity_curve=excluded.equity_curve,
+                evaluation_id=excluded.evaluation_id
             """,
             (
                 member_name,
@@ -172,6 +199,7 @@ def upsert_submission(member_name, strategy_name, res):
                 round(res["max_drawdown_pct"], 2),
                 datetime.now().strftime("%Y-%m-%d %H:%M UTC"),
                 equity_curve,
+                score_id,
             ),
         )
 
@@ -192,8 +220,8 @@ def get_strategy_metadata(strategy_filepath):
     return member_name.strip(), strategy_name.strip()
 
 
-def get_leaderboard() -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as conn:
+def get_leaderboard(score_id) -> pd.DataFrame:
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         df = pd.read_sql_query(
             """
             SELECT 
@@ -206,24 +234,27 @@ def get_leaderboard() -> pd.DataFrame:
                 max_drawdown_pct AS "Max DD (%)",
                 submitted_at AS "Submitted"
             FROM leaderboard
+            WHERE evaluation_id = ?
             ORDER BY sharpe DESC
             """,
             conn,
+            params=(score_id,),
         )
     df.index = df.index + 1
     df.index.name = "Rank"
     return df
 
 
-def get_equity_curves() -> dict:
-    """Load precomputed sequential equity curves keyed by (member, strategy)."""
-    with sqlite3.connect(DB_PATH) as conn:
+def get_equity_curves(score_id) -> dict:
+    """Load stored median equity curves keyed by (member, strategy)."""
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         rows = conn.execute(
             """
             SELECT member_name, strategy_name, equity_curve
             FROM leaderboard
-            WHERE equity_curve IS NOT NULL
-            """
+            WHERE equity_curve IS NOT NULL AND evaluation_id = ?
+            """,
+            (score_id,),
         ).fetchall()
 
     curves = {}
@@ -240,6 +271,7 @@ def get_equity_curves() -> dict:
 
 init_db()
 active_evaluation_windows = get_evaluation_windows()
+active_score_id = evaluation_id(active_evaluation_windows, OOS_SEED)
 st.set_page_config(page_title="Leaderboard - Nova Quant Club ", layout="wide")
 st.title("Nova Quant Club — Strategy Leaderboard")
 
@@ -251,12 +283,13 @@ leaderboard_tab, backtester_tab, submission_tab, guide_tab, admin_tab = st.tabs(
 with leaderboard_tab:
     st.subheader("Official Rankings")
     st.caption(
-        "Evaluated across undisclosed multi-regime market windows | Ranked by Annualized Sharpe Ratio on the concatenated equity curve (10 bps fee/slippage, 4% RF rate)"
+        f"Ranked by mean annualized Sharpe ratio across {OOS_JITTER_COPIES} jittered copies of historical prices. "
+        "Each reported metric is averaged across copies (0.10% trading fee, 4% risk-free rate)."
     )
 
     # Pinned SPY Benchmark Reference Bar
     try:
-        spy_bench = get_oos_spy_benchmark(active_evaluation_windows)
+        spy_bench = get_oos_spy_benchmark(active_evaluation_windows, OOS_SEED)
         st.markdown(f"##### Benchmark Reference: `SPY` Buy-and-Hold")
         b1, b2, b3, b4 = st.columns(4)
         b1.metric("SPY Sharpe", f"{spy_bench['sharpe']:.3f}")
@@ -267,17 +300,23 @@ with leaderboard_tab:
         st.warning(f"Could not load SPY benchmark banner: {e}")
 
     st.divider()
-    lb_df = get_leaderboard()
+    lb_df = get_leaderboard(active_score_id)
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        stale_count = conn.execute(
+            "SELECT COUNT(*) FROM leaderboard WHERE evaluation_id IS NULL OR evaluation_id != ?",
+            (active_score_id,),
+        ).fetchone()[0]
+    if stale_count:
+        st.info(f"{stale_count} older scores are awaiting re-scoring under the current jitter settings.")
     if lb_df.empty:
-        st.info("No strategies submitted yet. Head over to the Submit tab to beat SPY!")
+        st.info("No strategies have been scored under the current jitter settings.")
     else:
         st.dataframe(lb_df, width="stretch")
 
         st.markdown("##### Equity Curve Comparison")
         st.caption(
-            "Equity paths are precomputed when a strategy is scored and loaded from the "
-            "database. The hidden regimes are stitched together in order as one continuous "
-            "portfolio, starting at $100,000."
+            "Each line shows the median portfolio value across jittered copies at each trading day, "
+            "starting at $100,000. Ranking uses the individual copies."
         )
 
         options = {
@@ -291,7 +330,7 @@ with leaderboard_tab:
             key="lb_compare_select",
         )
 
-        stored_curves = get_equity_curves()
+        stored_curves = get_equity_curves(active_score_id)
         chart_df = pd.DataFrame()
         spy_series = None
         missing_curves = []
@@ -402,8 +441,9 @@ with backtester_tab:
 with submission_tab:
     st.subheader("Submit Strategy to the Leaderboard")
     st.caption(
-        f"Strategies are evaluated across multiple undisclosed historical market regimes "
-        f"with anonymized timestamps and base-100 prices. Submission cooldown: **{COOLDOWN_HOURS:g} hours**."
+        f"Strategies are evaluated on {OOS_JITTER_COPIES} jittered copies of historical prices. "
+        "Dates stay in order and are hidden from strategies. "
+        f"Submission cooldown: **{COOLDOWN_HOURS:g} hours**."
     )
     submission_success = st.session_state.pop("submission_success", None)
     if submission_success:
@@ -442,7 +482,7 @@ with submission_tab:
                             "Trader.name must contain at least one letter or number."
                         )
 
-                    with sqlite3.connect(DB_PATH) as conn:
+                    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
                         row = conn.execute(
                             """
                             SELECT submitted_at
@@ -471,24 +511,22 @@ with submission_tab:
 
                     if not cooldown_blocked:
                         with st.spinner(
-                            "Evaluating across secret multi-regime OOS windows vs SPY..."
+                            "Evaluating jittered historical prices against SPY..."
                         ):
+                            bt = Backtester(anonymize=True)
+                            res = bt.run_jittered(tmp_path, active_evaluation_windows, OOS_SEED)
+
                             saved_path = os.path.join(
                                 SUBMISSIONS_DIR, f"{safe_name}.py"
                             )
                             with open(saved_path, "wb") as f:
                                 f.write(sub_file.getvalue())
 
-                            bt = Backtester(anonymize=True)
-                            res = bt.run_multi_window(
-                                saved_path, active_evaluation_windows
-                            )
-
-                            upsert_submission(clean_member, clean_strat, res)
+                            upsert_submission(clean_member, clean_strat, res, active_score_id)
                             diff = res["sharpe"] - res["spy_sharpe"]
                             st.session_state["submission_success"] = (
-                                f"✅ Submitted across **{res['regimes_tested']}** hidden regimes! "
-                                f"Sharpe: **{res['sharpe']:.3f}** ({diff:+.3f} vs SPY) | "
+                                f"✅ Submitted across **{res['paths_tested']}** jittered copies! "
+                                f"Mean Sharpe: **{res['sharpe']:.3f}** ({diff:+.3f} vs SPY) | "
                                 f"Total Return: **{res['total_return_pct']:+.2f}%** | "
                                 f"Max Drawdown: **{res['max_drawdown_pct']:.2f}%** | "
                                 f"Alpha: **{res['alpha_pct']:+.2f}%** | "
@@ -543,8 +581,8 @@ with guide_tab:
     2. **Warm-up history:** At `step == 0`, `state.history` contains the prior 100 trading bars plus the current bar. In anonymized mode, history is indexed from `-100` through the current step, and evaluation bar `0` has an open price of 100. These bars are available for indicators but are not traded or scored.
     3. **Execution at Next Open:** Orders returned at bar $t$ are filled at the **Open price of bar $t+1$** with **10 bps (0.10%)** slippage/commission deducted.
     4. **Read-only macro symbols:** Symbols containing `^` or `=` can be used in `state.history` as signals, but non-zero orders for them are ignored.
-    5. **SPY Benchmark:** `SPY` Buy-and-Hold is initialized with $100,000 at the first day's Open (less the 10 bps fee) and held through the end of each evaluation window.
-    6. **Ranking Metric:** Annualized Daily Sharpe Ratio ($R_f = 4\\%$, $\\sqrt{252}$ scaling) computed on the **concatenated** Out-Of-Sample equity curve, alongside CAPM Alpha ($\\alpha$) and Beta ($\\beta$) relative to `SPY`. Regimes are chained in order, with each regime's ending equity carried into the next.
+    5. **SPY Benchmark:** `SPY` Buy-and-Hold is initialized with $100,000 at the first day's Open (less the 10 bps fee) and held through the end of each historical window. Portfolios reset between windows and their returns compound.
+    6. **Ranking Metric:** Mean annualized daily Sharpe ratio across the jittered copies, using a 4% risk-free rate and 252 trading days per year. Alpha, beta, return, and maximum drawdown are also averaged across copies.
     """)
     st.code(sample_code, language="python")
 
@@ -557,10 +595,10 @@ with admin_tab:
     else:
         st.success("Admin access granted.")
         new_windows = st.text_input(
-            "Evaluation Window(s)",
+            "Historical Source Windows",
             value=active_evaluation_windows,
             placeholder="YYYY-MM-DD:YYYY-MM-DD,YYYY-MM-DD:YYYY-MM-DD",
-            help="Use comma-separated start:end windows.",
+            help="Enter comma-separated start:end windows from held-out historical data. End dates are exclusive.",
             key="admin_windows",
         )
 
@@ -570,8 +608,7 @@ with admin_tab:
                 st.error(validation_error)
             else:
                 save_evaluation_windows(new_windows.strip())
-                active_evaluation_windows = new_windows.strip()
-                st.success("Evaluation windows updated.")
+                st.rerun()
 
         st.markdown("#### Re-evaluate strategies")
         if st.button("Re-Score Entire Leaderboard", key="admin_rescore"):
@@ -594,8 +631,8 @@ with admin_tab:
                     )
                     try:
                         member, strategy = get_strategy_metadata(fpath)
-                        result = bt.run_multi_window(fpath, active_evaluation_windows)
-                        upsert_submission(member, strategy, result)
+                        result = bt.run_jittered(fpath, active_evaluation_windows, OOS_SEED)
+                        upsert_submission(member, strategy, result, active_score_id)
                         success_count += 1
                     except Exception as e:
                         st.warning(f"Failed to re-evaluate {fname}: {e}")
@@ -635,7 +672,7 @@ with admin_tab:
                 delete_path = os.path.join(SUBMISSIONS_DIR, delete_file)
                 try:
                     member, strategy = get_strategy_metadata(delete_path)
-                    with sqlite3.connect(DB_PATH) as conn:
+                    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
                         conn.execute(
                             """
                             DELETE FROM leaderboard

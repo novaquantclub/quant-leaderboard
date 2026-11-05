@@ -8,28 +8,15 @@ import yfinance as yf
 
 
 WARMUP_BARS = 100
+PRICE_COLUMNS = ["Open", "High", "Low", "Close"]
+OOS_JITTER_COPIES = 30
+OOS_JITTER_SCALE = 0.10
 READ_ONLY_SYMBOL_MARKERS = ("^", "=")
 
 
 def is_read_only_symbol(symbol: str) -> bool:
     """Return whether a symbol may provide signals but cannot be traded."""
     return any(marker in symbol for marker in READ_ONLY_SYMBOL_MARKERS)
-
-
-def chain_equity_curves(curves: List[pd.Series], initial_value: float) -> pd.Series:
-    """Concatenate per-regime paths while preserving each curve's first return."""
-    parts = []
-    level = float(initial_value)
-    for index, curve in enumerate(curves):
-        curve_with_start = pd.concat(
-            [pd.Series([initial_value]), curve.astype(float)], ignore_index=True
-        )
-        part = curve_with_start / float(curve_with_start.iloc[0]) * level
-        level = float(part.iloc[-1])
-        if index > 0:
-            part = part.iloc[1:]
-        parts.append(part.reset_index(drop=True))
-    return pd.concat(parts, ignore_index=True)
 
 
 @dataclass
@@ -82,8 +69,9 @@ class Backtester:
             for t in tickers
         }
 
-    def _calc_metrics(self, equity_series: pd.Series) -> Dict[str, float]:
-        returns = equity_series.pct_change().fillna(0.0)
+    def _calc_metrics(self, equity_series: pd.Series, *, has_baseline=False) -> Dict:
+        returns = equity_series.pct_change()
+        returns = returns.iloc[1:] if has_baseline else returns.fillna(0.0)
         daily_rf = (1.0 + self.risk_free_rate) ** (1.0 / 252.0) - 1.0
         excess = returns - daily_rf
         std_ret = excess.std()
@@ -138,6 +126,12 @@ class Backtester:
             raise ValueError(
                 f"Insufficient history for the {WARMUP_BARS}-bar warm-up buffer."
             )
+        return self._run_path(trader, raw_data, spy_df, warmup_dates, evaluation_dates)
+
+    def _run_path(
+        self, trader, raw_data, spy_df, warmup_dates, evaluation_dates, *, official=False
+    ):
+        tickers = list(raw_data)
         all_dates = warmup_dates + evaluation_dates
         warmup_end_index = len(warmup_dates)
 
@@ -145,7 +139,7 @@ class Backtester:
         data = {}
         for t, df in raw_data.items():
             aligned = df.reindex(all_dates).ffill().bfill()
-            if self.anonymize:
+            if self.anonymize or official:
                 base_price = float(aligned["Open"].iloc[warmup_end_index])
                 base_vol = (
                     float(
@@ -156,7 +150,7 @@ class Backtester:
                     or 1.0
                 )
                 norm_df = aligned.copy()
-                for col in ["Open", "High", "Low", "Close"]:
+                for col in PRICE_COLUMNS:
                     norm_df[col] = (aligned[col] / base_price) * 100.0
                 norm_df["Volume"] = aligned["Volume"] / base_vol
                 norm_df.index = pd.RangeIndex(
@@ -238,15 +232,20 @@ class Backtester:
 
         eq_df = pd.DataFrame(equity_curve).set_index("Date")
 
-        spy_aligned = spy_df["Close"].reindex(eq_df.index).ffill().bfill()
-        spy_first_open = float(
-            spy_df["Open"].reindex(eq_df.index).ffill().bfill().iloc[0]
-        )
-        spy_shares = self.initial_cash / (spy_first_open * (1.0 + self.commission_rate))
-        eq_df["SPY_Benchmark"] = spy_shares * spy_aligned
+        eq_df["SPY_Benchmark"] = self._benchmark_curve(spy_df.loc[evaluation_dates])
 
-        strat_m = self._calc_metrics(eq_df["Strategy"])
-        spy_m = self._calc_metrics(eq_df["SPY_Benchmark"])
+        if official:
+            return eq_df
+
+        return {
+            **self._score_equity(eq_df),
+            "equity_df": eq_df,
+            "tickers": ", ".join(tickers),
+        }
+
+    def _score_equity(self, curve, *, has_baseline=False):
+        strat_m = self._calc_metrics(curve["Strategy"], has_baseline=has_baseline)
+        spy_m = self._calc_metrics(curve["SPY_Benchmark"], has_baseline=has_baseline)
 
         cov_matrix = np.cov(strat_m["excess_returns"], spy_m["excess_returns"])
         spy_var = cov_matrix[1, 1]
@@ -267,88 +266,145 @@ class Backtester:
             "spy_final_equity": spy_m["final_equity"],
             "alpha_pct": alpha_annual_pct,
             "beta": beta,
-            "equity_df": eq_df,
-            "tickers": ", ".join(tickers),
         }
 
-    def run_multi_window(self, strategy_filepath: str, windows_str: str) -> Dict:
-        """
-        Evaluates a fresh Trader instance across multiple secret (start, end) regimes.
-        windows_str format: "2018-09-01:2019-04-01,2022-01-01:2022-10-01,2025-02-01:2026-10-01"
+    def _benchmark_curve(self, prices):
+        shares = self.initial_cash / (float(prices["Open"].iloc[0]) * (1 + self.commission_rate))
+        return shares * prices["Close"]
 
-        Regimes are stitched together sequentially: the ending equity of one
-        regime becomes the starting equity of the next, giving one continuous
-        portfolio path. All reported metrics are calculated from that combined
-        path rather than averaged per regime.
-        """
-        pairs = [w.strip().split(":") for w in windows_str.split(",") if ":" in w]
-        results = []
-        for start_d, end_d in pairs:
-            fresh_trader = load_trader_from_file(strategy_filepath)
-            res = self.run(fresh_trader, start_d.strip(), end_d.strip())
-            results.append(res)
-
-        # Stitch each regime's path onto the end of the previous one. The
-        # prepended baseline preserves each window's first trading-day return,
-        # while subsequent baselines are dropped to avoid duplicate seam bars.
-        strategy_curve = chain_equity_curves(
-            [res["equity_df"]["Strategy"] for res in results], self.initial_cash
+    def _jitter_paths(self, tickers, windows_str, seed):
+        """Yield the same jittered prices for a symbol regardless of the strategy."""
+        windows = sorted(
+            tuple(pd.Timestamp(part.strip()) for part in entry.split(":"))
+            for entry in windows_str.split(",") if entry.strip()
         )
-        spy_curve = chain_equity_curves(
-            [res["equity_df"]["SPY_Benchmark"] for res in results], self.initial_cash
-        )
-        absolute_equity = pd.DataFrame(
-            {"Strategy": strategy_curve, "SPY_Benchmark": spy_curve}
-        )
-        absolute_equity.index.name = "Trading Day"
+        if not windows:
+            raise ValueError("At least one historical source window is required.")
+        for index, (start, end) in enumerate(windows):
+            if start >= end:
+                raise ValueError("Source window end dates must follow their start dates.")
+            if index and start < windows[index - 1][1]:
+                raise ValueError("Historical source windows must not overlap.")
 
-        # Score the concatenated curve exactly like a single backtest.
-        strat_m = self._calc_metrics(absolute_equity["Strategy"])
-        spy_m = self._calc_metrics(absolute_equity["SPY_Benchmark"])
-
-        cov_matrix = np.cov(strat_m["excess_returns"], spy_m["excess_returns"])
-        spy_var = cov_matrix[1, 1]
-        beta = float(cov_matrix[0, 1] / spy_var) if spy_var > 1e-12 else 0.0
-        daily_alpha = (
-            strat_m["excess_returns"].mean() - beta * spy_m["excess_returns"].mean()
-        )
-        alpha_annual_pct = float(daily_alpha * 252 * 100.0)
-
-        equity_curve_df = absolute_equity.copy()
-        equity_curve_df.index.name = "Trading Day"
-
-        return {
-            "sharpe": strat_m["sharpe"],
-            "spy_sharpe": spy_m["sharpe"],
-            "total_return_pct": strat_m["total_return_pct"],
-            "max_drawdown_pct": strat_m["max_drawdown_pct"],
-            "alpha_pct": alpha_annual_pct,
-            "beta": beta,
-            "tickers": results[0]["tickers"],
-            "regimes_tested": len(results),
-            "equity_curve_df": equity_curve_df,
-        }
-
-    def run_benchmark_multi_window(self, windows_str: str) -> Dict:
-        """Buy-and-hold benchmark metrics on the same concatenated regime path."""
-        pairs = [w.strip().split(":") for w in windows_str.split(",") if ":" in w]
-        curves = []
-        for start_d, end_d in pairs:
-            spy_df = self._download_single(
-                self.benchmark_ticker, start_d.strip(), end_d.strip()
+        symbols = list(dict.fromkeys([self.benchmark_ticker, *tickers]))
+        buffer_start = windows[0][0] - pd.Timedelta(days=365)
+        raw_data = {
+            symbol: self._download_single(
+                symbol, buffer_start.strftime("%Y-%m-%d"), windows[-1][1].strftime("%Y-%m-%d")
             )
-            spy_open = float(spy_df["Open"].iloc[0])
-            shares = self.initial_cash / (spy_open * (1.0 + self.commission_rate))
-            curves.append(shares * spy_df["Close"])
+            for symbol in symbols
+        }
+        calendar = raw_data[self.benchmark_ticker].index
 
-        combined = chain_equity_curves(curves, self.initial_cash)
-        metrics = self._calc_metrics(combined)
+        for index, (start, end) in enumerate(windows):
+            warmup = list(calendar[calendar < start][-WARMUP_BARS:])
+            evaluation = list(calendar[(calendar >= start) & (calendar < end)])
+            if len(warmup) < WARMUP_BARS or len(evaluation) < 10:
+                raise ValueError(
+                    f"Each window needs {WARMUP_BARS} prior SPY trading days and at least "
+                    "10 SPY trading days to score."
+                )
+            dates = warmup + evaluation
+            aligned = {
+                symbol: raw_data[symbol].reindex(dates, method="ffill")
+                for symbol in symbols
+            }
+            warmup_returns = {}
+            for symbol, prices in aligned.items():
+                values = prices[PRICE_COLUMNS].to_numpy(dtype=float)
+                if not np.isfinite(values).all() or (values <= 0).any():
+                    raise ValueError(
+                        f"'{symbol}' needs finite, positive prices throughout each window and its warm-up."
+                    )
+                warmup_returns[symbol] = np.diff(np.log(prices["Close"].iloc[:WARMUP_BARS]))
+
+            # Share a market shock across all assets. Estimate its influence on
+            # each symbol from the warm-up, then add symbol-specific noise.
+            # Derive random streams from the window and symbol, not ticker order.
+            shape = (OOS_JITTER_COPIES, len(evaluation))
+            market = warmup_returns[self.benchmark_ticker]
+            market_std = float(np.std(market, ddof=1))
+            market_shock = np.random.default_rng([seed, index]).standard_normal(shape)
+            levels = {}
+            for symbol, returns in warmup_returns.items():
+                if symbol == self.benchmark_ticker:
+                    shocks = market_std * market_shock
+                else:
+                    loading = (
+                        float(np.cov(returns, market)[0, 1] / market_std)
+                        if market_std > 0 else 0.0
+                    )
+                    residual_std = np.sqrt(max(0.0, np.var(returns, ddof=1) - loading ** 2))
+                    symbol_seed = int.from_bytes(symbol.encode("utf-8"), "little")
+                    residual_shock = np.random.default_rng([seed, index, symbol_seed]).standard_normal(shape)
+                    shocks = loading * market_shock + residual_std * residual_shock
+                levels[symbol] = np.exp(np.cumsum(OOS_JITTER_SCALE * shocks, axis=1))
+
+            for copy_index in range(OOS_JITTER_COPIES):
+                jittered = {}
+                for symbol, prices in aligned.items():
+                    adjusted = prices.copy()
+                    factors = np.concatenate((np.ones(WARMUP_BARS), levels[symbol][copy_index]))
+                    adjusted[PRICE_COLUMNS] = prices[PRICE_COLUMNS].mul(factors, axis=0)
+                    jittered[symbol] = adjusted
+                yield copy_index, jittered, warmup, evaluation
+
+    def _jittered_equity(self, tickers, windows_str, seed, strategy_filepath=None):
+        # A copy uses the real dates within each window. Reset positions at
+        # window boundaries, then compound the equity without adding gap returns.
+        segments = [[] for _ in range(OOS_JITTER_COPIES)]
+        for copy_index, prices, warmup, evaluation in self._jitter_paths(tickers, windows_str, seed):
+            benchmark = prices[self.benchmark_ticker]
+            if strategy_filepath is None:
+                curve = self._benchmark_curve(benchmark.loc[evaluation]).to_frame("SPY_Benchmark")
+            else:
+                curve = self._run_path(
+                    load_trader_from_file(strategy_filepath),
+                    {symbol: prices[symbol] for symbol in tickers},
+                    benchmark, warmup, evaluation, official=True,
+                )[["Strategy", "SPY_Benchmark"]]
+            segments[copy_index].append(curve.reset_index(drop=True))
+
+        for copies in segments:
+            baseline = pd.DataFrame(
+                [[self.initial_cash] * len(copies[0].columns)], columns=copies[0].columns
+            )
+            parts = [baseline]
+            for curve in copies:
+                parts.append(curve * (parts[-1].iloc[-1] / self.initial_cash))
+            yield pd.concat(parts, ignore_index=True)
+
+    def run_jittered(self, strategy_filepath: str, windows_str: str, seed: int) -> Dict:
+        """Rank a strategy by its average score on jittered historical prices."""
+        trader = load_trader_from_file(strategy_filepath)
+        tickers = [t.strip().upper() for t in getattr(trader, "tickers", [])]
+        if not tickers or len(tickers) > 20:
+            raise ValueError("Strategy must declare between 1 and 20 valid yfinance tickers.")
+
+        curves = list(self._jittered_equity(tickers, windows_str, seed, strategy_filepath))
+        results = [self._score_equity(curve, has_baseline=True) for curve in curves]
+        metric_names = (
+            "sharpe", "spy_sharpe", "total_return_pct", "max_drawdown_pct", "alpha_pct", "beta",
+        )
+        median_values = np.median([curve.to_numpy() for curve in curves], axis=0)
+        median_equity = pd.DataFrame(median_values, columns=curves[0].columns)
+        median_equity.index.name = "Trading Day"
         return {
-            "sharpe": metrics["sharpe"],
-            "total_return_pct": metrics["total_return_pct"],
-            "max_drawdown_pct": metrics["max_drawdown_pct"],
-            "final_equity": metrics["final_equity"],
-            "regimes": len(pairs),
+            **{name: float(np.mean([result[name] for result in results])) for name in metric_names},
+            "tickers": ", ".join(tickers),
+            "paths_tested": len(results),
+            "equity_curve_df": median_equity,
+        }
+
+    def run_benchmark_jittered(self, windows_str: str, seed: int) -> Dict:
+        """Score SPY on the same jittered prices used for submissions."""
+        results = [
+            self._calc_metrics(curve["SPY_Benchmark"], has_baseline=True)
+            for curve in self._jittered_equity([], windows_str, seed)
+        ]
+        return {
+            name: float(np.mean([result[name] for result in results]))
+            for name in ("sharpe", "total_return_pct", "max_drawdown_pct", "final_equity")
         }
 
 

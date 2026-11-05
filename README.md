@@ -16,12 +16,21 @@ Every strategy is evaluated against an SPY buy-and-hold benchmark using:
 - Beta to SPY
 - Equity curve and final portfolio value
 
-Official submissions are run across multiple historical, out-of-sample market
-windows. The windows are chained into one continuous equity curve, carrying the
-ending portfolio value from one regime into the next. Evaluation windows are
-configured by the organizer and are not exposed to competitors.
+Official submissions use 30 jittered copies of held-out historical prices.
+Jittering adds small random changes to daily returns while keeping trading
+days in their original order. The shocks use 10% of the daily volatility
+estimated from the 100 trading days before each evaluation window. Each asset
+gets a shared market shock and, except for SPY, its own additional shock.
+Open, high, low, and close on a given day are scaled together. Warm-up prices,
+within-day price ratios, and volume are unchanged.
 
-The default simulation assumptions are:
+Each copy starts with a fresh strategy and portfolio in each source window.
+Window returns compound in order and gaps contribute no returns. Rankings
+use the mean annualized Sharpe ratio across copies. Other score metrics are
+also averaged across copies, while the equity chart shows the median
+portfolio value at each trading day.
+
+The default evaluation assumptions are:
 
 - Starting capital: **$100,000**
 - Commission/slippage: **10 basis points (0.10%)**
@@ -96,7 +105,9 @@ The `state` object includes:
 
 Prices and timestamps are anonymized during official evaluation: prices are
 rebased to 100 at the first bar and dates are replaced with integer bar indices.
-This helps prevent strategies from identifying hidden evaluation regimes.
+Official evaluation requires price data throughout the historical source
+windows and positive open, high, low, and close prices so the evaluator can
+scale each ticker's price path.
 
 ## Test locally
 
@@ -108,8 +119,7 @@ python backtester.py sample_strategy.py --start 2024-01-01 --end 2025-01-01
 
 The web app's **Backtester** tab also accepts a `.py` file and plots the strategy
 equity curve against SPY on selected in-sample dates. Local results are useful
-for development, but they do not predict performance on the hidden official
-windows.
+for development, but they do not predict performance on the official jittered evaluations.
 
 ## Submit to the leaderboard
 
@@ -127,7 +137,7 @@ subject to the configured submission cooldown.
 
 1. **No lookahead bias:** `state.history` contains only data available through
    the current bar.
-2. **Warm-up history:** each evaluation window starts at `step == 0` with 100
+2. **Warm-up history:** each historical window starts at `step == 0` with 100
    prior trading bars in `state.history`; warm-up bars do not affect scoring or
    portfolio execution.
 3. **Next-open execution:** orders are filled at the following day's open.
@@ -147,13 +157,21 @@ The app supports these environment variables:
 | --- | --- | --- |
 | `CLUB_PASSWORD` | Password required for member submissions | `password` |
 | `ADMIN_PASSWORD` | Password for organizer controls | `password` |
-| `SECRET_OOS_WINDOWS` | Initial comma-separated `start:end` evaluation windows | Two example 2018 windows |
+| `SECRET_OOS_WINDOWS` | Initial comma-separated historical `start:end` windows (end dates exclusive) | One window in 2018 and one in 2019 |
+| `SECRET_OOS_SEED` | Non-negative number that fixes the price perturbations for a given market calendar | `20261105` |
 | `COOLDOWN_HOURS` | Minimum hours between updates to the same member/strategy | `0` |
 | `DB_PATH` | SQLite database location | `data/leaderboard.db` |
 
 For any shared or deployed instance, set strong passwords and configure
-evaluation windows through environment variables or the Admin tab. The default
-passwords are intended only for local development.
+historical source windows through environment variables or the Admin tab.
+Use completed, non-overlapping windows from dates outside strategy development.
+Each window needs at least 10 SPY trading days plus 100 prior warm-up days. The default passwords are
+intended only for local development.
+
+Scores from previous evaluation methods stay in the database and are excluded from the
+current rankings. Use **Admin > Re-Score Entire Leaderboard** to evaluate saved
+strategies under the jitter settings. Run it again after changing the
+source windows or seed.
 
 ## Project structure
 
