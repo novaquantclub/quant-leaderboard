@@ -204,6 +204,18 @@ class NativeSandboxTests(unittest.TestCase):
             self.sandbox(source).run(wire_state())["trader_data"], "limited"
         )
 
+    def test_common_strategy_randomness_reproduces_across_fresh_workers(self):
+        source = (
+            SOURCE[: SOURCE.index("    def run")]
+            + """    def run(self, state):
+        import random, numpy as np
+        return {}, repr((random.random(), np.random.random()))
+"""
+        )
+        first = self.sandbox(source).run(wire_state())["trader_data"]
+        second = self.sandbox(source).run(wire_state())["trader_data"]
+        self.assertEqual(first, second)
+
     def test_real_worker_http_round_trip_and_frozen_final_scoring(self):
         from backtester import EngineConfig
         from competition import Competition

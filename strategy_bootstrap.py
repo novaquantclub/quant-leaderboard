@@ -4,9 +4,11 @@ import importlib.util
 import json
 import math
 import os
+import random
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 
 MAX_REPLY = 262_144
@@ -14,6 +16,9 @@ MAX_STATE = 16_000_000
 
 
 def main():
+    # This public strategy seed is independent of the private market seed.
+    random.seed(0)
+    np.random.seed(0)
     # Strategy prints cannot corrupt the protocol or fill a log file. This is
     # convenience, not a security boundary: the supervisor validates all replies.
     protocol = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)

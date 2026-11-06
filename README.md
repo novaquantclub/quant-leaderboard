@@ -39,6 +39,12 @@ class Trader:
 Return an order dictionary or `(orders, trader_data)`. Persistent string data
 must be no larger than 100 KB; uploaded Python files are limited to 128 KB.
 
+Strategies should be deterministic. Standard Python/NumPy RNGs use a public seed
+of zero in each fresh worker; explicitly seed independent generators such as
+`numpy.random.default_rng` and model `random_state` parameters as well. Wall-clock
+time and native entropy are not virtualized, so arbitrary randomized code is
+not guaranteed to reproduce just because the market snapshot is frozen.
+
 Orders fill at the next open with 10 bps costs. Positions are long-only; symbols
 containing `^` or `=` are signals and cannot be traded. Both portfolios start in
 cash at the first close. SPY buys at the following open, which is the first fill
