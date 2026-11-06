@@ -5,6 +5,14 @@ strategies and compare them on a shared backtesting engine. The Streamlit app
 provides a leaderboard, an interactive sandbox, official submissions, and an
 organizer admin panel.
 
+## Synthetic round preparation
+
+A standalone [synthetic market generator](SYNTHETIC_ROUNDS.md) can now prepare
+frozen competition datasets from the public training data. It generates fresh
+OHLCV paths and warm-up histories instead of perturbing historical evaluation
+windows. The Streamlit app still uses the jitter evaluator described below;
+synthetic evaluation and upload isolation are the next integration steps.
+
 ## What is evaluated?
 
 Every strategy is evaluated against an SPY buy-and-hold benchmark using:
