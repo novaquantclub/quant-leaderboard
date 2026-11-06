@@ -2,7 +2,7 @@ import numpy as np
 
 
 class Trader:
-    # Any valid yfinance ticker(s)
+    # Use only symbols present in the round's published training CSVs.
     tickers = [
         "SPY",
         "QQQ",
@@ -58,15 +58,6 @@ class Trader:
 
 
 if __name__ == "__main__":
-    import argparse
-    from backtester import Backtester, print_backtest_results
-
-    parser = argparse.ArgumentParser(description="Run the sample strategy backtest")
-    parser.add_argument("--start", default="2024-01-01", help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end", default="2025-01-01", help="End date (YYYY-MM-DD)")
-    args = parser.parse_args()
-
-    trader = Trader()
-    print(f"Running {trader.name} from {args.start} to {args.end}...")
-    results = Backtester().run(trader, args.start, args.end)
-    print_backtest_results(results)
+    print(
+        "Run: python backtester.py sample_strategy.py --data training --trusted-local"
+    )

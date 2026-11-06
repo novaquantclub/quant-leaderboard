@@ -8,16 +8,16 @@ This module never loads or executes participant strategies.
 import argparse
 import hashlib
 import json
+import re
 import secrets
 import shutil
 import tempfile
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping
 
 import numpy as np
 import pandas as pd
-
 
 GENERATOR_VERSION = "synthetic-market-v1"
 COLUMNS = ("Open", "High", "Low", "Close", "Volume")
@@ -26,7 +26,9 @@ MAX_VALUES = 15_000_000
 
 
 def _json_bytes(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode()
 
 
 def _digest(value):
@@ -35,7 +37,7 @@ def _digest(value):
 
 def _integer(value, name, minimum, maximum):
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-        raise ValueError(f"{name} must be an integer.")
+        raise ValueError(f"{name} must be an integer.")  # noqa: TRY004 - uniform public validation contract
     if not minimum <= value <= maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}.")
 
@@ -76,23 +78,51 @@ def calibrate_market(training: Mapping[str, pd.DataFrame]) -> MarketModel:
     frames = {}
     for symbol, frame in training.items():
         if not isinstance(symbol, str) or not symbol.strip() or len(symbol) > 32:
-            raise ValueError("Symbols must be non-empty strings of at most 32 characters.")
+            raise ValueError(
+                "Symbols must be non-empty strings of at most 32 characters."
+            )
         clean = symbol.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9.^=_-]{1,32}", clean):
+            raise ValueError(
+                "Symbols may contain uppercase letters, numbers, '.', '^', '=', '_', and '-'."
+            )
         if clean in frames:
             raise ValueError(f"Duplicate symbol after normalization: {clean}.")
-        if not isinstance(frame, pd.DataFrame) or not set(COLUMNS).issubset(frame.columns):
-            raise ValueError(f"{clean} needs Open, High, Low, Close, and Volume columns.")
+        if not isinstance(frame, pd.DataFrame) or not set(COLUMNS).issubset(
+            frame.columns
+        ):
+            raise ValueError(
+                f"{clean} needs Open, High, Low, Close, and Volume columns."
+            )
         if not frame.columns.is_unique:
             raise ValueError(f"{clean} has duplicate column names.")
         if len(frame) < MIN_TRAINING_BARS:
-            raise ValueError(f"{clean} needs at least {MIN_TRAINING_BARS} training bars.")
-        if not frame.index.is_unique or not frame.index.is_monotonic_increasing or frame.index.hasnans:
-            raise ValueError(f"{clean} needs a unique, increasing index without missing values.")
+            raise ValueError(
+                f"{clean} needs at least {MIN_TRAINING_BARS} training bars."
+            )
+        if (
+            not frame.index.is_unique
+            or not frame.index.is_monotonic_increasing
+            or frame.index.hasnans
+        ):
+            raise ValueError(
+                f"{clean} needs a unique, increasing index without missing values."
+            )
         values = frame.loc[:, list(COLUMNS)].to_numpy(dtype=float)
-        if not np.isfinite(values).all() or (values[:, :4] <= 0).any() or (values[:, 4] < 0).any():
-            raise ValueError(f"{clean} needs finite, positive prices and non-negative volume.")
+        if (
+            not np.isfinite(values).all()
+            or (values[:, :4] <= 0).any()
+            or (values[:, 4] < 0).any()
+        ):
+            raise ValueError(
+                f"{clean} needs finite, positive prices and non-negative volume."
+            )
         opening, high, low, close = values[:, :4].T
-        if ((high < np.maximum(opening, close)) | (low > np.minimum(opening, close)) | (low > high)).any():
+        if (
+            (high < np.maximum(opening, close))
+            | (low > np.minimum(opening, close))
+            | (low > high)
+        ).any():
             raise ValueError(f"{clean} has invalid OHLC ordering.")
         frames[clean] = frame.loc[:, list(COLUMNS)].astype(float)
 
@@ -100,9 +130,15 @@ def calibrate_market(training: Mapping[str, pd.DataFrame]) -> MarketModel:
     reference = frames[symbols[0]].index
     if any(not frames[symbol].index.equals(reference) for symbol in symbols):
         raise ValueError("All symbols must have the same complete training calendar.")
-    source_hash = hashlib.sha256(_json_bytes({
-        "symbols": symbols, "columns": COLUMNS, "index": [str(value) for value in reference],
-    }))
+    source_hash = hashlib.sha256(
+        _json_bytes(
+            {
+                "symbols": symbols,
+                "columns": COLUMNS,
+                "index": [str(value) for value in reference],
+            }
+        )
+    )
     for symbol in symbols:
         source_hash.update(frames[symbol].to_numpy(dtype="<f8").tobytes(order="C"))
 
@@ -114,14 +150,23 @@ def calibrate_market(training: Mapping[str, pd.DataFrame]) -> MarketModel:
         sessions.append(np.log(close[1:] / opening[1:]))
         returns = np.diff(np.log(close))
         variance = np.var(returns[:-1], ddof=1)
-        phi = np.cov(returns[:-1], returns[1:])[0, 1] / variance if variance > 1e-12 else 0.0
+        phi = (
+            np.cov(returns[:-1], returns[1:])[0, 1] / variance
+            if variance > 1e-12
+            else 0.0
+        )
         autoregression.append(float(np.clip(phi, -0.25, 0.25)))
         upper = np.maximum(np.log(high / np.maximum(opening, close)), 1e-6)
         lower = np.maximum(np.log(np.minimum(opening, close) / low), 1e-6)
-        wicks.append([
-            [float(np.log(side).mean()), float(np.clip(np.log(side).std(), 0.05, 1.0))]
-            for side in (upper, lower)
-        ])
+        wicks.append(
+            [
+                [
+                    float(np.log(side).mean()),
+                    float(np.clip(np.log(side).std(), 0.05, 1.0)),
+                ]
+                for side in (upper, lower)
+            ]
+        )
         volume_sigma.append(float(np.clip(np.std(np.log1p(volume), ddof=1), 0.05, 1.0)))
 
     # Joint overnight/intraday covariance retains relationships across assets,
@@ -131,18 +176,26 @@ def calibrate_market(training: Mapping[str, pd.DataFrame]) -> MarketModel:
     covariance = 0.95 * covariance + 0.05 * np.diag(np.diag(covariance))
     covariance += np.eye(len(covariance)) * 1e-10
     means = observations.mean(axis=0)
-    means = np.clip(means, -0.15 * np.sqrt(np.diag(covariance)), 0.15 * np.sqrt(np.diag(covariance)))
-    return MarketModel(symbols, {
-        "means": means.tolist(),
-        "covariance": covariance.tolist(),
-        "autoregression": autoregression,
-        "wicks": wicks,
-        "volume_sigma": volume_sigma,
-    }, source_hash.hexdigest())
+    means = np.clip(
+        means, -0.15 * np.sqrt(np.diag(covariance)), 0.15 * np.sqrt(np.diag(covariance))
+    )
+    return MarketModel(
+        symbols,
+        {
+            "means": means.tolist(),
+            "covariance": covariance.tolist(),
+            "autoregression": autoregression,
+            "wicks": wicks,
+            "volume_sigma": volume_sigma,
+        },
+        source_hash.hexdigest(),
+    )
 
 
 def _prices_hash(prices):
-    return hashlib.sha256(np.asarray(prices, dtype="<f8").tobytes(order="C")).hexdigest()
+    return hashlib.sha256(
+        np.asarray(prices, dtype="<f8").tobytes(order="C")
+    ).hexdigest()
 
 
 @dataclass
@@ -160,13 +213,21 @@ class SyntheticRound:
         _integer(path_index, "path_index", 0, self.prices.shape[0] - 1)
         universe = self.manifest["symbols"]
         selected = list(universe) if symbols is None else list(symbols)
-        if not selected or len(set(selected)) != len(selected) or set(selected) - set(universe):
+        if (
+            not selected
+            or len(set(selected)) != len(selected)
+            or set(selected) - set(universe)
+        ):
             raise ValueError("Select unique symbols from the round's fixed universe.")
         config = self.manifest["config"]
-        index = pd.RangeIndex(-config["warmup_bars"], config["evaluation_bars"], name="Step")
+        index = pd.RangeIndex(
+            -config["warmup_bars"], config["evaluation_bars"], name="Step"
+        )
         return {
             symbol: pd.DataFrame(
-                self.prices[path_index, universe.index(symbol)].copy(), index=index, columns=COLUMNS,
+                self.prices[path_index, universe.index(symbol)].copy(),
+                index=index,
+                columns=COLUMNS,
             )
             for symbol in selected
         }
@@ -187,12 +248,16 @@ class SyntheticRound:
             np.savez_compressed(temporary / "prices.npz", prices=self.prices)
             (temporary / "manifest.json").write_bytes(_json_bytes(self.manifest))
             if private_seed is not None:
-                (temporary / "private_seed.json").write_bytes(_json_bytes({"seed": str(private_seed)}))
+                (temporary / "private_seed.json").write_bytes(
+                    _json_bytes({"seed": str(private_seed)})
+                )
             temporary.rename(destination)
         finally:
             if temporary.exists():
                 if temporary.resolve().parent != destination.parent.resolve():
-                    raise RuntimeError("Refusing to clean up outside the round directory.")
+                    raise RuntimeError(
+                        "Refusing to clean up outside the round directory."
+                    )
                 shutil.rmtree(temporary)
 
     @classmethod
@@ -204,7 +269,9 @@ class SyntheticRound:
         result = cls(prices, manifest)
         _validate_round(result)
         if expected_dataset_id is not None and result.dataset_id != expected_dataset_id:
-            raise ValueError("Synthetic dataset does not match the committed dataset ID.")
+            raise ValueError(
+                "Synthetic dataset does not match the committed dataset ID."
+            )
         result.prices.setflags(write=False)
         return result
 
@@ -217,14 +284,23 @@ def _validate_round(round_data):
     symbols = manifest["symbols"]
     if not symbols or len(symbols) > 20 or symbols != sorted(set(symbols)):
         raise ValueError("Invalid synthetic universe.")
-    expected = (config.paths, len(symbols), config.warmup_bars + config.evaluation_bars, len(COLUMNS))
+    expected = (
+        config.paths,
+        len(symbols),
+        config.warmup_bars + config.evaluation_bars,
+        len(COLUMNS),
+    )
     prices = round_data.prices
     if prices.size > MAX_VALUES or prices.shape != expected or prices.dtype.kind != "f":
         raise ValueError("Synthetic snapshot has an invalid shape or data type.")
     if not np.isfinite(prices).all() or (prices <= 0).any():
-        raise ValueError("Synthetic snapshot must contain finite, positive OHLCV values.")
+        raise ValueError(
+            "Synthetic snapshot must contain finite, positive OHLCV values."
+        )
     opening, high, low, close = [prices[..., i] for i in range(4)]
-    if (high < np.maximum(opening, close)).any() or (low > np.minimum(opening, close)).any():
+    if (high < np.maximum(opening, close)).any() or (
+        low > np.minimum(opening, close)
+    ).any():
         raise ValueError("Synthetic snapshot has invalid OHLC ordering.")
     if manifest.get("prices_sha256") != _prices_hash(prices):
         raise ValueError("Synthetic snapshot hash does not match its manifest.")
@@ -242,7 +318,10 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
     config = config if config is not None else SyntheticConfig()
     assets = len(model.symbols)
     bars = config.warmup_bars + config.evaluation_bars
-    if not 1 <= assets <= 20 or config.paths * assets * bars * len(COLUMNS) > MAX_VALUES:
+    if (
+        not 1 <= assets <= 20
+        or config.paths * assets * bars * len(COLUMNS) > MAX_VALUES
+    ):
         raise ValueError("Synthetic round exceeds the supported dataset size.")
     parameters = model.parameters
     means = np.asarray(parameters["means"])
@@ -254,7 +333,9 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
     volume_sigma = np.asarray(parameters["volume_sigma"])
     prices = np.empty((config.paths, assets, bars, len(COLUMNS)), dtype=float)
     for path_index in range(config.paths):
-        rng = np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(path_index, 0)))
+        rng = np.random.default_rng(
+            np.random.SeedSequence(seed, spawn_key=(path_index, 0))
+        )
         previous_close = np.full(assets, 100.0)
         previous_return = means[:assets] + means[assets:]
         variance = 1.0
@@ -265,9 +346,13 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
             regime_scale = (1.75 if stress else 0.75) / np.sqrt((1.75**2 + 0.75**2) / 2)
             # One radial draw gives multivariate t innovations with covariance
             # matching the fitted Gaussian covariance before volatility scaling.
-            innovation = (factor @ rng.standard_normal(2 * assets)) * np.sqrt(5 / rng.chisquare(7))
+            innovation = (factor @ rng.standard_normal(2 * assets)) * np.sqrt(
+                5 / rng.chisquare(7)
+            )
             returns = means + np.sqrt(variance) * regime_scale * innovation
-            returns[assets:] += phi * (previous_return - means[:assets] - means[assets:])
+            returns[assets:] += phi * (
+                previous_return - means[:assets] - means[assets:]
+            )
             returns = np.clip(returns, -0.25, 0.25)
             opening = previous_close * np.exp(returns[:assets])
             close = opening * np.exp(returns[assets:])
@@ -276,20 +361,52 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
             previous_close = close
             previous_return = returns[:assets] + returns[assets:]
             standardized = innovation / scales
-            variance = float(np.clip(0.02 + 0.92 * variance + 0.06 * variance * np.mean(standardized**2), 0.15, 6))
+            variance = float(
+                np.clip(
+                    0.02 + 0.92 * variance + 0.06 * variance * np.mean(standardized**2),
+                    0.15,
+                    6,
+                )
+            )
 
         for asset in range(assets):
-            candle_rng = np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(path_index, 1, asset)))
+            candle_rng = np.random.default_rng(
+                np.random.SeedSequence(seed, spawn_key=(path_index, 1, asset))
+            )
             candle = prices[path_index, asset]
-            extensions = np.minimum(np.exp(candle_rng.normal(wicks[asset, :, 0], wicks[asset, :, 1], size=(bars, 2))), 0.25)
-            candle[:, 1] = np.maximum(candle[:, 0], candle[:, 3]) * np.exp(extensions[:, 0])
-            candle[:, 2] = np.minimum(candle[:, 0], candle[:, 3]) * np.exp(-extensions[:, 1])
-            volume_rng = np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(path_index, 2, asset)))
+            extensions = np.minimum(
+                np.exp(
+                    candle_rng.normal(
+                        wicks[asset, :, 0], wicks[asset, :, 1], size=(bars, 2)
+                    )
+                ),
+                0.25,
+            )
+            candle[:, 1] = np.maximum(candle[:, 0], candle[:, 3]) * np.exp(
+                extensions[:, 0]
+            )
+            candle[:, 2] = np.minimum(candle[:, 0], candle[:, 3]) * np.exp(
+                -extensions[:, 1]
+            )
+            volume_rng = np.random.default_rng(
+                np.random.SeedSequence(seed, spawn_key=(path_index, 2, asset))
+            )
             # More active candles tend to have more volume; every volume is new.
-            activity = np.abs(np.log(candle[:, 3] / candle[:, 0])) / scales[assets + asset]
-            candle[:, 4] = np.exp(np.clip(volume_sigma[asset] * (volume_rng.standard_normal(bars) + 0.25 * activity), -10, 10))
+            activity = (
+                np.abs(np.log(candle[:, 3] / candle[:, 0])) / scales[assets + asset]
+            )
+            candle[:, 4] = np.exp(
+                np.clip(
+                    volume_sigma[asset]
+                    * (volume_rng.standard_normal(bars) + 0.25 * activity),
+                    -10,
+                    10,
+                )
+            )
             candle[:, :4] *= 100.0 / candle[config.warmup_bars, 0]
-            candle[:, 4] /= candle[config.warmup_bars - 20:config.warmup_bars, 4].mean()
+            candle[:, 4] /= candle[
+                config.warmup_bars - 20 : config.warmup_bars, 4
+            ].mean()
 
     manifest = {
         "generator_version": GENERATOR_VERSION,
@@ -308,26 +425,51 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Freeze a private synthetic competition dataset from public training CSVs.")
-    parser.add_argument("training_directory", type=Path, help="One SYMBOL.csv per asset; Date or Step in the first column, followed by OHLCV.")
-    parser.add_argument("output_directory", type=Path, help="New private directory; existing rounds are never overwritten.")
+    parser = argparse.ArgumentParser(
+        description="Freeze a private synthetic competition dataset from public training CSVs."
+    )
+    parser.add_argument(
+        "training_directory",
+        type=Path,
+        help="One SYMBOL.csv per asset; Date or Step in the first column, followed by OHLCV.",
+    )
+    parser.add_argument(
+        "output_directory",
+        type=Path,
+        help="New private directory; existing rounds are never overwritten.",
+    )
     parser.add_argument("--paths", type=int, default=30)
-    parser.add_argument("--bars", type=int, default=252, help="Scored bars per independent path.")
+    parser.add_argument(
+        "--bars", type=int, default=252, help="Scored bars per independent path."
+    )
     parser.add_argument("--warmup", type=int, default=100)
-    parser.add_argument("--seed", type=int, help="Explicit seed for public practice data or controlled regeneration. Omit for a fresh 128-bit seed.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Explicit seed for public practice data or controlled regeneration. Omit for a fresh 128-bit seed.",
+    )
     args = parser.parse_args()
     seed = args.seed if args.seed is not None else secrets.randbits(128)
     try:
         csvs = sorted(args.training_directory.glob("*.csv"))
-        training = {path.stem: pd.read_csv(path, index_col=0) for path in csvs}
+        training = {
+            path.stem: pd.read_csv(path, index_col=0, float_precision="round_trip")
+            for path in csvs
+        }
         model = calibrate_market(training)
-        round_data = generate_round(model, seed, SyntheticConfig(args.paths, args.bars, args.warmup))
+        round_data = generate_round(
+            model, seed, SyntheticConfig(args.paths, args.bars, args.warmup)
+        )
         round_data.save(args.output_directory, private_seed=seed)
     except (ValueError, OSError) as exc:
         parser.exit(1, f"Cannot create synthetic round: {exc}\n")
-    print(f"Saved {args.paths} synthetic paths for {', '.join(model.symbols)} to {args.output_directory}.")
+    print(
+        f"Saved {args.paths} synthetic paths for {', '.join(model.symbols)} to {args.output_directory}."
+    )
     print(f"Dataset commitment: {round_data.dataset_id}")
-    print("Keep this entire directory private. It contains future prices and the final-test seed.")
+    print(
+        "Keep this entire directory private. It contains future prices and the final-test seed."
+    )
 
 
 if __name__ == "__main__":

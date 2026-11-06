@@ -1,205 +1,147 @@
-# Nova Quant Club Leaderboard
+# Nova Quant League
 
-Nova Quant Club is a strategy competition where members build algorithmic trading
-strategies and compare them on a shared backtesting engine. The Streamlit app
-provides a leaderboard, an interactive sandbox, official submissions, and an
-organizer admin panel.
+A team strategy competition with a public training dataset, an online practice
+backtester, immutable strategy versions, and blind final testing on independent
+synthetic markets.
 
-## Synthetic round preparation
+## Competition flow
 
-A standalone [synthetic market generator](SYNTHETIC_ROUNDS.md) can now prepare
-frozen competition datasets from the public training data. It generates fresh
-OHLCV paths and warm-up histories instead of perturbing historical evaluation
-windows. The Streamlit app still uses the jitter evaluator described below;
-synthetic evaluation and upload isolation are the next integration steps.
+1. An organizer prepares the public OHLCV CSVs and opens a round. The app freezes
+   the public data, generates the private final dataset once, and records a
+   dataset commitment and evaluation identity.
+2. Organizers issue a separate random access token to each team.
+3. Teams download the same public dataset, practice locally or online, and
+   upload strategy versions. Practice never uses the final dataset.
+4. Each team explicitly selects one final version. Upload limits and cooldowns
+   apply to the authenticated team, independently of the strategy's name or author.
+5. The organizer locks submissions and selections, then evaluates those frozen
+   versions. Final metrics, errors, benchmark values, and curves remain private.
+6. The organizer publishes the finished leaderboard. Ranking uses median Sharpe
+   across independent synthetic paths, with path dispersion and a conditional
+   bootstrap interval shown alongside it.
 
-## What is evaluated?
+## Strategy API
 
-Every strategy is evaluated against an SPY buy-and-hold benchmark using:
+Start with `sample_strategy.py`:
 
-- **Annualized Sharpe ratio** (the official ranking metric)
-- Total return
-- Maximum drawdown
-- Annualized CAPM alpha
-- Beta to SPY
-- Equity curve and final portfolio value
+```python
+class Trader:
+    name = "My strategy"
+    author = "Your name"  # Descriptive; the login token determines the team.
+    tickers = ["SPY", "QQQ", "GLD"]  # Subset of the round's fixed universe.
 
-Official submissions use 30 jittered copies of held-out historical prices.
-Jittering adds small random changes to daily returns while keeping trading
-days in their original order. The shocks use 10% of the daily volatility
-estimated from the 100 trading days before each evaluation window. Each asset
-gets a shared market shock and, except for SPY, its own additional shock.
-Open, high, low, and close on a given day are scaled together. Warm-up prices,
-within-day price ratios, and volume are unchanged.
+    def run(self, state):
+        return {"SPY": 10} if state.step == 0 else {}
+```
 
-Each copy starts with a fresh strategy and portfolio in each source window.
-Window returns compound in order and gaps contribute no returns. Rankings
-use the mean annualized Sharpe ratio across copies. Other score metrics are
-also averaged across copies, while the equity chart shows the median
-portfolio value at each trading day.
+`run` receives `step`, `history`, `positions`, `cash`, `portfolio_value`, and
+`trader_data`. History contains OHLCV bars from `-100` through the current step.
+Return an order dictionary or `(orders, trader_data)`. Persistent string data
+must be no larger than 100 KB; uploaded Python files are limited to 128 KB.
 
-The default evaluation assumptions are:
+Orders fill at the next open with 10 bps costs. Positions are long-only; symbols
+containing `^` or `=` are signals and cannot be traded. Both portfolios start in
+cash at the first close. SPY buys at the following open, which is the first fill
+opportunity available to a strategy.
 
-- Starting capital: **$100,000**
-- Commission/slippage: **10 basis points (0.10%)**
-- Risk-free rate: **4%**
-- 252 trading days per year
-- SPY benchmark purchased at the first available open, after the same fee
+## Public data and local practice
 
-## Run locally
-
-Python 3.10+ is recommended.
+Install Python 3.10+ and the application requirements in a virtual environment:
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-streamlit run app.py
 ```
 
-Open the URL printed by Streamlit, usually
-`http://localhost:8501`.
-
-The app creates its SQLite database and submission directory under `data/`.
-Market data is downloaded through `yfinance`, so an internet connection is
-required when running backtests.
-
-## Build a strategy
-
-Start with [`sample_strategy.py`](sample_strategy.py) or download it from the
-Guide tab. A strategy file must define a `Trader` class with:
-
-```python
-class Trader:
-    tickers = ["SPY", "QQQ", "GLD"]
-
-    def __init__(self):
-        self.name = "My Strategy"
-        self.author = "My Name"
-
-    def run(self, state):
-        return {"SPY": 10}
-```
-
-### Strategy requirements
-
-- `tickers` must contain between 1 and 20 valid Yahoo Finance ticker symbols.
-- `name` and `author` must be non-empty strings.
-- `run(state)` is called once per trading day.
-- Return a dictionary mapping ticker symbols to share quantities. Positive
-  quantities buy; negative quantities sell.
-- Symbols containing `^` or `=` are read-only macro signals. They are available
-  in `state.history`, but all non-zero orders for them are ignored.
-- At evaluation `step == 0`, `state.history` already contains the prior 100
-  trading bars plus the current bar. These warm-up bars are provided for
-  indicators but are not scored or traded. In anonymized mode, the history
-  index runs from `-100` through the current `step`, and evaluation bar `0`
-  has an open price of 100.
-- Orders returned at the current bar are filled at the **next bar's open**.
-- Orders are subject to available cash, current positions, and the 10 bps fee.
-- Strategies may optionally return `(orders, trader_data)`. `trader_data` must
-  be a string smaller than 100 KB and can preserve state between bars.
-
-The `state` object includes:
-
-| Attribute | Description |
-| --- | --- |
-| `step` | An anonymized integer bar index |
-| `history` | OHLCV data through the current bar for each declared ticker |
-| `positions` | Current share positions by ticker |
-| `cash` | Available cash |
-| `portfolio_value` | Cash plus marked-to-market positions |
-| `trader_data` | Persistent string state from the previous bar |
-
-Prices and timestamps are anonymized during official evaluation: prices are
-rebased to 100 at the first bar and dates are replaced with integer bar indices.
-Official evaluation requires price data throughout the historical source
-windows and positive open, high, low, and close prices so the evaluator can
-scale each ticker's price path.
-
-## Test locally
-
-Use the same backtesting engine as the web app:
+Supply your own public CSVs or download a sample dataset once:
 
 ```powershell
-python backtester.py sample_strategy.py --start 2024-01-01 --end 2025-01-01
+python prepare_training.py data/training --start 2020-01-01 --end 2026-01-01 --tickers SPY QQQ GLD
 ```
 
-The web app's **Backtester** tab also accepts a `.py` file and plots the strategy
-equity curve against SPY on selected in-sample dates. Local results are useful
-for development, but they do not predict performance on the official jittered evaluations.
+Those dates are an example for **public training**, not hidden evaluation
+windows. Each `SYMBOL.csv` needs an ordered Date/Step index and
+`Open,High,Low,Close,Volume`. Assets must share a complete calendar and have at
+least 120 bars, including the 100-bar warm-up. Downloads use the shared calendar
+intersection without backfilling. Never revise a published dataset in place.
 
-## Submit to the leaderboard
+Teams can download the training ZIP and SDK from the app, then run their own
+code locally without an online worker:
 
-1. Implement your `Trader` class and test it locally.
-2. Open **Submit to Leaderboard**.
-3. Enter the club upload password.
-4. Upload the strategy `.py` file.
-5. Review the scored metrics on the **Leaderboard** tab.
+```powershell
+python backtester.py sample_strategy.py --data training --trusted-local
+```
 
-The leaderboard uses `Trader.author` and `Trader.name` as the member and
-strategy identifiers. A member can update an existing member/strategy entry,
-subject to the configured submission cooldown.
+`--trusted-local` executes the named script on the user's own machine. Use it
+only for code you trust. The web application has no corresponding fallback.
 
-## Competition rules
+## Hosting and isolation
 
-1. **No lookahead bias:** `state.history` contains only data available through
-   the current bar.
-2. **Warm-up history:** each historical window starts at `step == 0` with 100
-   prior trading bars in `state.history`; warm-up bars do not affect scoring or
-   portfolio execution.
-3. **Next-open execution:** orders are filled at the following day's open.
-4. **Transaction costs apply:** every trade includes 10 bps commission/slippage.
-5. **Read-only macro symbols:** symbols containing `^` or `=` may be used for
-   signals but cannot be traded.
-6. **Long-only positions:** sell orders cannot exceed the current position.
-7. **No date leakage:** official timestamps and prices are anonymized.
-8. **Benchmark consistency:** every score is compared with SPY under the same
-   starting capital and fee assumptions.
-
-## Configuration
-
-The app supports these environment variables:
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `CLUB_PASSWORD` | Password required for member submissions | `password` |
-| `ADMIN_PASSWORD` | Password for organizer controls | `password` |
-| `SECRET_OOS_WINDOWS` | Initial comma-separated historical `start:end` windows (end dates exclusive) | One window in 2018 and one in 2019 |
-| `SECRET_OOS_SEED` | Non-negative number that fixes the price perturbations for a given market calendar | `20261105` |
-| `COOLDOWN_HOURS` | Minimum hours between updates to the same member/strategy | `0` |
-| `DB_PATH` | SQLite database location | `data/leaderboard.db` |
-
-For any shared or deployed instance, set strong passwords and configure
-historical source windows through environment variables or the Admin tab.
-Use completed, non-overlapping windows from dates outside strategy development.
-Each window needs at least 10 SPY trading days plus 100 prior warm-up days. The default passwords are
-intended only for local development.
-
-Scores from previous evaluation methods stay in the database and are excluded from the
-current rankings. Use **Admin > Re-Score Entire Leaderboard** to evaluate saved
-strategies under the jitter settings. Run it again after changing the
-source windows or seed.
-
-## Project structure
-
-| File | Purpose |
-| --- | --- |
-| [`app.py`](app.py) | Streamlit UI, submissions, leaderboard, and admin controls |
-| [`backtester.py`](backtester.py) | Data loading, simulation, metrics, and CLI |
-| [`sample_strategy.py`](sample_strategy.py) | Starter moving-average strategy |
-| [`requirements.txt`](requirements.txt) | Python dependencies |
-| [`nixpacks.toml`](nixpacks.toml) | Deployment start command |
-| `data/` | Runtime SQLite database and uploaded submissions |
-
-## Deployment
-
-The repository includes a Nixpacks configuration that starts the app with:
+The web app stays on **Coolify with Nixpacks**, using the existing start command:
 
 ```text
 streamlit run app.py
 ```
 
-Provide the environment variables above in the deployment platform, persist the
-`data/` directory if leaderboard history must survive redeployments, and ensure
-the service can reach Yahoo Finance.
+Hosted uploads run in a separate **native Linux worker**, using bubblewrap and
+seccomp. No Docker daemon, Dockerfile, privileged web container, or Docker socket
+is required for the strategy runner. See [DEPLOYMENT.md](DEPLOYMENT.md) for the
+native service and Coolify connection setup.
+
+Every import, constructor, and `run` call executes inside that worker. It gets
+only the source and current trading state. The app's database, passwords,
+private dataset, seed, and future bars are never sent to it or mounted into the
+guest. The guest has a read-only filesystem, separate process/network/user
+namespaces, no network sockets, and CPU, memory, process, output, and time limits.
+Unsupported or unavailable isolation causes evaluation to fail closed.
+
+## Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `ADMIN_PASSWORD` | Organizer password, at least 32 characters; no usable default |
+| `NQC_WORKER_URL` | Authenticated worker endpoint; HTTPS except localhost |
+| `NQC_WORKER_TOKEN` | Separate random worker credential, at least 32 characters |
+| `DB_PATH` | SQLite path, default `data/leaderboard.db` |
+| `ROUND_ROOT` | Frozen round storage, default `data/rounds` |
+
+Set these through Coolify's environment configuration; the app does not
+automatically load `.env`. Keep `data/` on persistent storage. Team tokens are
+generated in the organizer panel and stored only as hashes. Club passwords,
+historical source windows, and public default OOS seeds are no longer used.
+
+Existing legacy tables and uploaded files are left in place. They do not enter
+the new rankings. Start a new round, issue team tokens, and have teams upload
+and select their final versions; legacy uploads are not automatically executed.
+
+## What synthetic evaluation means
+
+Final paths are newly simulated OHLCV histories, including warm-up and volume,
+calibrated from the published data. They use joint overnight/intraday covariance,
+bounded return autocorrelation, heavy-tailed shocks, changing volatility, and
+calm/stress regimes. There is no real historical final path to identify.
+
+Each round saves the generated prices and their hash. Every team uses the same
+universe, paths, execution settings, and worker runtime. Dataset, code, settings,
+and dependency changes cannot silently reuse an existing evaluation identity.
+
+This measures performance under the declared model. It does not establish
+future real-market performance. The displayed interval describes Monte Carlo
+uncertainty conditional on the model; it does not include model error. Inspect
+the model's realism and baseline strategies on the actual public dataset before
+running a competition. See [SYNTHETIC_ROUNDS.md](SYNTHETIC_ROUNDS.md) and
+[REVIEW_RESPONSE.md](REVIEW_RESPONSE.md).
+
+## Verification
+
+```powershell
+python -B -m unittest discover -s tests -v
+```
+
+Run the same suite under an unprivileged Linux account with bubblewrap and
+libseccomp installed to exercise the real sandbox. Windows checks the frontend,
+engine, database, snapshots, protocol, and refusal to run without isolation.
+Linux additionally tests native-library strategies, host-file/secret/network
+isolation, fork prevention, read-only files, memory/output/time limits, and an
+end-to-end HTTP worker evaluation on frozen synthetic data.

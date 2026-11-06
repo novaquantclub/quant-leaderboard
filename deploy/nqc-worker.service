@@ -1,0 +1,31 @@
+[Unit]
+Description=Nova Quant isolated strategy worker
+After=network.target
+
+[Service]
+Type=simple
+User=nqc-worker
+Group=nqc-worker
+WorkingDirectory=/opt/nqc-worker
+EnvironmentFile=/etc/nqc-worker.env
+ExecStart=/opt/nqc-worker/.venv/bin/python -I -B /opt/nqc-worker/strategy_runner.py --host 127.0.0.1 --port 8788
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/tmp
+CapabilityBoundingSet=
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TasksMax=160
+MemoryMax=2G
+CPUQuota=200%
+LimitNOFILE=1024
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

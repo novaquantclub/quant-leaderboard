@@ -1,9 +1,9 @@
 # Synthetic competition datasets
 
 `synthetic_market.py` prepares fixed synthetic datasets for the competition.
-The Streamlit app still uses the historical jitter evaluator until the next
-integration step. Preparing synthetic prices alone does not isolate uploaded
-code or prevent lookahead inside the current evaluator.
+The Streamlit app freezes these datasets when an organizer creates a round.
+Uploaded strategies execute in the separate native Linux worker described in
+`DEPLOYMENT.md`, with only the current history prefix sent over the protocol.
 
 ## What the generator does
 
@@ -81,8 +81,9 @@ prices = round_data.path(0, ["SPY", "QQQ"])
 Loading verifies the price hash and market invariants. The stored array is
 read-only; each call to `path` returns independent DataFrames. Use this saved
 bundle for every submission and re-score, rather than downloading market data
-or regenerating the round. A future evaluation ID must combine its `dataset_id`
-with the execution engine version and all scoring/execution settings.
+or regenerating the round. The evaluation ID combines its `dataset_id`
+with the execution engine version, numerical library versions, worker runtime
+fingerprint, and all scoring/execution settings.
 Pass the recorded commitment as `expected_dataset_id` to `SyntheticRound.load`
 when verifying that both the manifest and the prices match the original round.
 

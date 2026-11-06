@@ -1,0 +1,8 @@
+# Resolve once in the dedicated worker venv and freeze it for the round.
+# A runtime fingerprint prevents silent upgrades from changing official scores.
+numpy>=1.26,<3
+pandas>=2.1,<4
+scipy
+statsmodels
+scikit-learn
+numba
