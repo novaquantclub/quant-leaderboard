@@ -139,6 +139,21 @@ fresh rates jointly with returns, using rate-conditioned asset covariances
 estimated from the public data. Their saved arrays and hashes participate in
 the round commitment and evaluation identity.
 
+## Complete member package
+
+Build one ZIP containing the public CSVs, the existing starter example, local
+backtesting support, numerical dependencies, public engine settings, a member
+README, and a VS Code workspace file.
+
+```powershell
+python member_package.py data/training-with-interest-rate data/deliverables/nova-quant-member-starter.zip
+```
+
+Extract the ZIP into a separate folder and open its `.code-workspace` file.
+The member README supplies the strategy interface and pilot rules. Teams develop
+their own `strategy.py` and record their research and validation in `RESULTS.md`.
+The same package is available from the app's Guide tab for a prepared round.
+
 ## Hosting and isolation
 
 The web app stays on **Coolify with Nixpacks**, using the existing start command:

@@ -1,14 +1,10 @@
 """Nova Quant Club: public practice, authenticated final selections, blind rounds."""
 
 import hmac
-import io
 import json
 import os
-import re
 import sqlite3
-import zipfile
 from datetime import UTC, datetime
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -17,6 +13,7 @@ UI_ERRORS = (ValueError, OSError, RuntimeError, sqlite3.Error)
 
 from backtester import Backtester, EngineConfig
 from competition import Competition
+from member_package import member_zip, sdk_zip
 from strategy_runner import MAX_SOURCE, RemoteTrader, worker_runtime_id
 from synthetic_market import SyntheticConfig
 
@@ -28,44 +25,6 @@ def uploaded_source(file):
     if not 0 < len(content) <= MAX_SOURCE:
         raise ValueError("Strategy files must be between 1 byte and 128 KB.")
     return content.decode("utf-8-sig")
-
-
-def sdk_zip(tickers=None, benchmark="ATLAS"):
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        for name in (
-            "backtester.py",
-            "synthetic_market.py",
-            "interest_rate.py",
-            "strategy_runner.py",
-            "sample_strategy.py",
-        ):
-            content = Path(__file__).with_name(name).read_text(encoding="utf-8")
-            if name == "sample_strategy.py" and tickers is not None:
-                content = re.sub(
-                    r"(?m)^    tickers = .+$",
-                    f"    tickers = {tuple(tickers)!r}",
-                    content,
-                    count=1,
-                )
-                content = content.replace(
-                    "--benchmark ATLAS", f"--benchmark {benchmark}"
-                )
-            archive.writestr(name, content)
-        archive.writestr(
-            "README.md",
-            "# Nova Quant League strategy SDK\n\n"
-            "Research the published asset histories and discover their relationships. "
-            "The starter provides a basic moving-average example.\n\n"
-            "When supplied, state.observations['interest rate'] is a pandas Series "
-            "of available annualized percentages, including warm-up. A value of "
-            "5.25 means 5.25% per year.\n\n"
-            "Install numpy, pandas and scipy in your local Python environment, "
-            "then extract the training CSVs into a training folder and run your own code.\n\n"
-            "```sh\npython backtester.py sample_strategy.py --data training "
-            f"--benchmark {benchmark} --trusted-local\n```\n",
-        )
-    return output.getvalue()
 
 
 def main():
@@ -282,9 +241,17 @@ def main():
         st.subheader("Strategy SDK")
         tickers = sorted(store.public_market(round_id)) if current else None
         benchmark = json.loads(current["config"])["benchmark"] if current else "ATLAS"
+        config = EngineConfig(**json.loads(current["config"])) if current else None
+        if current:
+            st.download_button(
+                "Download complete member starter package",
+                member_zip(current["public_dir"], config),
+                "nova-quant-member-starter.zip",
+                "application/zip",
+            )
         st.download_button(
             "Download SDK and starter strategy",
-            sdk_zip(tickers, benchmark),
+            sdk_zip(tickers, benchmark, config),
             "nova-quant-sdk.zip",
             "application/zip",
         )

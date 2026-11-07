@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -284,7 +284,10 @@ def main():
     parser.add_argument("strategy_file")
     parser.add_argument("--data", default="data/training")
     parser.add_argument(
-        "--benchmark", default="SPY", help="Benchmark asset in the dataset."
+        "--config", type=Path, help="Public engine settings JSON supplied with the SDK."
+    )
+    parser.add_argument(
+        "--benchmark", help="Override the benchmark asset in the engine settings."
     )
     parser.add_argument(
         "--trusted-local",
@@ -293,7 +296,14 @@ def main():
     )
     args = parser.parse_args()
     market = load_training(args.data)
-    engine = Backtester(EngineConfig(benchmark=args.benchmark))
+    config = (
+        EngineConfig(**json.loads(args.config.read_text(encoding="utf-8")))
+        if args.config
+        else EngineConfig()
+    )
+    if args.benchmark is not None:
+        config = replace(config, benchmark=args.benchmark)
+    engine = Backtester(config)
     if args.trusted_local:
         result = engine.run_dataset(load_local_trader(args.strategy_file), market)
     else:
