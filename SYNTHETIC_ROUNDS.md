@@ -35,6 +35,30 @@ The generator constants are public and versioned; only final random draws and
 the final seed are hidden. Independent synthetic paths do not remove model
 misspecification or justify claims of real-world statistical significance.
 
+## interest rate
+
+Training may include `interest rate.csv`, with a single `interest rate` column
+in annualized percent and the same Date/Step index as the asset CSVs. Strategies
+receive its available history through `state.observations["interest rate"]`.
+Price and volume normalization applies to asset histories. Rates retain their
+published units, including zero or negative values when supplied.
+
+Generator v2 fits a persistent, bounded rate process and joint covariance matrices
+for asset overnight returns, asset intraday returns, and rate innovations. The
+matrices are estimated separately below and above the public sample's median
+rate, using the previous observed rate for conditioning. Small groups use the
+full-sample estimate, and covariance shrinkage keeps sampling well-conditioned.
+Each step uses the previous generated rate to choose the covariance regime and
+draws the next rate and asset shocks jointly. Public data determines the model's
+relationships. Teams investigate which relationships their strategies can use.
+
+Initial rates are sampled from public calibration quantiles. The simulator saves
+fresh rate histories, including warm-up, alongside the synthetic asset arrays.
+The rate hash and calibration data enter the dataset commitment. These are
+model-conditioned simulations. Policy timing, causal market responses, and
+historical revision vintages require further assumptions beyond this model.
+Saved v1 asset-only snapshots remain readable.
+
 ## Prepare one round
 
 Place the exact public training CSVs in `data/training/`, one file per asset,
@@ -57,6 +81,8 @@ python synthetic_market.py data/training data/rounds/practice --seed 12345
 The final bundle contains:
 
 - `prices.npz`: all generated prices, including future bars; keep private.
+- `prices.npz` also contains `interest_rates` when the public dataset supplies
+  interest rate. These future observations belong to the private final bundle.
 - `manifest.json`: generator version, dependency versions, configuration, asset
   universe, training/model/price hashes, and a seed commitment; no raw seed.
 - `private_seed.json`: the final seed; keep private and never distribute to teams.

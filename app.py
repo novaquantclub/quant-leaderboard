@@ -36,6 +36,7 @@ def sdk_zip(tickers=None, benchmark="ATLAS"):
         for name in (
             "backtester.py",
             "synthetic_market.py",
+            "interest_rate.py",
             "strategy_runner.py",
             "sample_strategy.py",
         ):
@@ -56,6 +57,9 @@ def sdk_zip(tickers=None, benchmark="ATLAS"):
             "# Nova Quant League strategy SDK\n\n"
             "Research the published asset histories and discover their relationships. "
             "The starter provides a basic moving-average example.\n\n"
+            "When supplied, state.observations['interest rate'] is a pandas Series "
+            "of available annualized percentages, including warm-up. A value of "
+            "5.25 means 5.25% per year.\n\n"
             "Install numpy, pandas and scipy in your local Python environment, "
             "then extract the training CSVs into a training folder and run your own code.\n\n"
             "```sh\npython backtester.py sample_strategy.py --data training "
@@ -294,6 +298,7 @@ def main():
 7. Practice freely on public data, store your versions, and explicitly choose one final entry before the organizer locks the round.
 8. Finals use independent synthetic paths fitted to the public data. Scores remain hidden until the organizer publishes the closed round.
 9. Research the assets and discover their relationships using the published observations.
+10. When supplied, `state.observations["interest rate"]` contains the available rate history in annualized percent, including warm-up. For example, 5.25 means 5.25% per year.
 
 Your team identity comes from your access token. `Trader.author` is descriptive and cannot select another team's leaderboard entry.
 """)

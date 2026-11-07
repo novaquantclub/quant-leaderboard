@@ -58,6 +58,15 @@ def main():
                 )
                 for symbol, values in state["history"].items()
             }
+            state["observations"] = {
+                name: pd.Series(
+                    values,
+                    name=name,
+                    dtype=float,
+                    index=pd.RangeIndex(state["history_start"], state["step"] + 1),
+                )
+                for name, values in state.get("observations", {}).items()
+            }
             state.pop("history_start")
             result = trader.run(SimpleNamespace(**state))
             orders, trader_data = (

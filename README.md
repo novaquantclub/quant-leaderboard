@@ -99,6 +99,46 @@ relationships themselves.
 `--trusted-local` executes the named script on the user's own machine. Use it
 only for code you trust. The web application has no corresponding fallback.
 
+## interest rate
+
+The expanded public dataset adds `interest rate.csv`, with `Date` and
+`interest rate` columns on the same calendar as the five asset files. The series
+is the effective federal funds rate in annualized percent. A value of `5.25`
+means 5.25% per year. The published label remains **interest rate**. Teams can
+research its relationship with the asset histories.
+
+Organizers create a new dataset version from the prepared asset files.
+
+```powershell
+python interest_rate.py data/training data/training-with-interest-rate
+```
+
+The downloader uses FRED's DFF series and records its source hash, download time,
+and availability convention in the
+organizer-only provenance file. Each effective-date observation becomes
+available after two US federal business days. Forward filling carries the latest
+available observation onto the shared asset calendar. This is a conservative
+daily publication rule. The frozen download contains current-vintage history,
+including revisions available at download time. The New York Fed publishes
+the prior business day's EFFR at approximately 9 a.m.
+[FRED DFF](https://fred.stlouisfed.org/series/DFF),
+[New York Fed publication details](https://www.newyorkfed.org/markets/reference-rates/effr)
+
+The strategy receives a separate macro observation history in its original units.
+
+```python
+rate_history = state.observations.get("interest rate")
+if rate_history is not None:
+    current_rate_percent = float(rate_history.iloc[-1])
+```
+
+The engine passes only the available prefix, including warm-up, with the same
+integer index as asset history. Interest rate is an observed research signal.
+Orders and positions use the declared competition assets. Synthetic finals draw
+fresh rates jointly with returns, using rate-conditioned asset covariances
+estimated from the public data. Their saved arrays and hashes participate in
+the round commitment and evaluation identity.
+
 ## Hosting and isolation
 
 The web app stays on **Coolify with Nixpacks**, using the existing start command:

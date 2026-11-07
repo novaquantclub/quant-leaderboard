@@ -13,6 +13,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from backtester import Backtester, EngineConfig, evaluation_id, load_training
+from interest_rate import INTEREST_RATE_FILE
 from strategy_runner import (
     MAX_SOURCE,
     RemoteTrader,
@@ -177,6 +178,11 @@ class Competition:
             frame.loc[:, list(COLUMNS)].to_csv(
                 public_dir / f"{symbol}.csv", index_label=frame.index.name or "Step"
             )
+        if training.interest_rate is not None:
+            training.interest_rate.to_csv(
+                public_dir / INTEREST_RATE_FILE,
+                index_label=training.interest_rate.index.name or "Step",
+            )
         model = calibrate_market(load_training(public_dir))
         seed = secrets.randbits(128)
         dataset = generate_round(model, seed, synthetic_config)
@@ -221,6 +227,13 @@ class Competition:
                     f"{symbol}.csv",
                     frame.to_csv(index_label=frame.index.name or "Step"),
                 )
+            if market.interest_rate is not None:
+                archive.writestr(
+                    INTEREST_RATE_FILE,
+                    market.interest_rate.to_csv(
+                        index_label=market.interest_rate.index.name or "Step"
+                    ),
+                )
             archive.writestr(
                 "README.md",
                 "# Nova Quant League training data\n\n"
@@ -235,7 +248,18 @@ class Competition:
                 "steps and normalized prices and volume. Orders execute at the next open. "
                 f"Costs are {config.commission_bps:g} basis points per trade. "
                 f"The comparison benchmark buys and holds {config.benchmark}.\n\n"
-                "Final evaluation uses independent synthetic paths calibrated from this dataset.\n",
+                + (
+                    "The interest rate CSV contains observed annualized percentages. "
+                    "A value of 5.25 represents 5.25% per year. Each row contains the "
+                    "latest value available under the dataset's two-federal-business-day "
+                    "publication lag. This is fixed current-vintage history. Strategies "
+                    "read its history through state.observations['interest rate']. "
+                    "Source details are available at "
+                    "[FRED](https://fred.stlouisfed.org/series/DFF).\n\n"
+                    if market.interest_rate is not None
+                    else ""
+                )
+                + "Final evaluation uses independent synthetic paths calibrated from this dataset.\n",
             )
         return output.getvalue()
 

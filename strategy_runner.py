@@ -444,6 +444,10 @@ class RemoteTrader:
             "cash": state.cash,
             "portfolio_value": state.portfolio_value,
             "trader_data": state.trader_data,
+            "observations": {
+                name: series.to_numpy().tolist()
+                for name, series in getattr(state, "observations", {}).items()
+            },
         }
         return validate_orders(
             self._request(f"/sessions/{self.session}/step", payload), self.tickers

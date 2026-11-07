@@ -26,6 +26,7 @@ class Trader:
         state.cash              # Current cash available for trading
         state.portfolio_value   # Current total portfolio value (cash + positions)
         state.trader_data       # Persistent string state from previous bar (max 100 KB)
+        state.observations      # Optional macro histories, including 'interest rate' in annualized percent
         """
         orders = {}
 

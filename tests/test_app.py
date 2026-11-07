@@ -2,6 +2,8 @@ import ast
 import importlib.util
 import io
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -14,6 +16,48 @@ from unittest.mock import patch
     "Streamlit UI checks run in the web app environment",
 )
 class AppTests(unittest.TestCase):
+    def test_extracted_sdk_runs_with_interest_rate_data(self):
+        import pandas as pd
+        from test_synthetic_market import training_fixture
+
+        from app import sdk_zip
+        from interest_rate import INTEREST_RATE, MarketData
+        from prepare_training import save_training
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with zipfile.ZipFile(io.BytesIO(sdk_zip(["ATLAS"], "ATLAS"))) as archive:
+                archive.extractall(root)
+            frame = training_fixture(130)["SPY"]
+            save_training(
+                MarketData(
+                    {"ATLAS": frame},
+                    interest_rate=pd.Series(
+                        [5.25] * 130, index=frame.index, name=INTEREST_RATE
+                    ),
+                ),
+                root / "training",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "backtester.py",
+                    "sample_strategy.py",
+                    "--data",
+                    "training",
+                    "--benchmark",
+                    "ATLAS",
+                    "--trusted-local",
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+            self.assertIn("benchmark_sharpe", result.stdout)
+
     def test_downloaded_starter_uses_round_asset_names(self):
         from app import sdk_zip
 

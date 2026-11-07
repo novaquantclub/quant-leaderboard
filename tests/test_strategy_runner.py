@@ -130,6 +130,20 @@ class NativeSandboxTests(unittest.TestCase):
         self.assertEqual(result["orders"], {"SPY": 1})
         self.assertEqual(result["trader_data"], "101")
 
+    def test_interest_rate_history_arrives_as_observed_percentages(self):
+        source = (
+            SOURCE[: SOURCE.index("    def run")]
+            + """    def run(self, state):
+        rate = state.observations['interest rate']
+        assert rate.index[-1] == state.step
+        return {}, repr((len(rate), float(rate.iloc[-1])))
+"""
+        )
+        state = wire_state()
+        state["observations"] = {"interest rate": [5.25] * 101}
+        result = self.sandbox(source).run(state)
+        self.assertEqual(result["trader_data"], "(101, 5.25)")
+
     def test_host_files_environment_network_writes_and_fork_are_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             secret = Path(directory) / "private-marker"
@@ -217,11 +231,19 @@ class NativeSandboxTests(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_real_worker_http_round_trip_and_frozen_final_scoring(self):
+        import pandas as pd
+
         from backtester import EngineConfig
         from competition import Competition
+        from interest_rate import INTEREST_RATE, INTEREST_RATE_FILE
         from synthetic_market import SyntheticConfig
 
         token = "integration-test-only-worker-token-12345678"
+        source = SOURCE.replace(
+            "return {'SPY': 1}, str(len(state.history['SPY']))",
+            "assert len(state.observations['interest rate']) == 101 + state.step\n"
+            "        return {'SPY': 1}, str(len(state.history['SPY']))",
+        )
         server = WorkerServer(("127.0.0.1", 0), token)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -232,6 +254,9 @@ class NativeSandboxTests(unittest.TestCase):
                 training.mkdir()
                 for symbol, frame in training_fixture(130).items():
                     frame.to_csv(training / f"{symbol}.csv", index_label="Date")
+                pd.Series([5.25] * 130, index=frame.index, name=INTEREST_RATE).to_csv(
+                    training / INTEREST_RATE_FILE, index_label="Date"
+                )
                 store = Competition(root / "db.sqlite", root / "rounds")
                 team_token = store.create_team("Integration team")
                 team = store.authenticate(team_token)
@@ -245,9 +270,9 @@ class NativeSandboxTests(unittest.TestCase):
                 with patch.dict(
                     os.environ, {"NQC_WORKER_URL": endpoint, "NQC_WORKER_TOKEN": token}
                 ):
-                    with RemoteTrader(SOURCE) as trader:
+                    with RemoteTrader(source) as trader:
                         version = store.submit(
-                            round_id, team["id"], SOURCE, trader.metadata
+                            round_id, team["id"], source, trader.metadata
                         )
                     store.select(round_id, team["id"], version)
                     store.lock_round(round_id)

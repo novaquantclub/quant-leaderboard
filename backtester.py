@@ -4,16 +4,17 @@ import argparse
 import hashlib
 import importlib.util
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from interest_rate import INTEREST_RATE, validate_interest_rate
 from strategy_runner import RemoteTrader, validate_orders
-from synthetic_market import COLUMNS, SyntheticRound, calibrate_market
+from synthetic_market import COLUMNS, SyntheticRound, load_training
 
-ENGINE_VERSION = "streamed-next-open-v3"
+ENGINE_VERSION = "streamed-next-open-v4"
 WARMUP_BARS = 100
 
 
@@ -49,20 +50,7 @@ class TradingState:
     cash: float
     portfolio_value: float
     trader_data: str = ""
-
-
-def load_training(directory):
-    paths = sorted(Path(directory).glob("*.csv"))
-    frames = {
-        path.stem.strip().upper(): pd.read_csv(
-            path, index_col=0, float_precision="round_trip"
-        )
-        for path in paths
-    }
-    if len(frames) != len(paths):
-        raise ValueError("Duplicate training symbols.")
-    calibrate_market(frames)  # Same strict OHLCV/calendar validation as generation.
-    return {symbol: frame.loc[:, list(COLUMNS)] for symbol, frame in frames.items()}
+    observations: dict = field(default_factory=dict)
 
 
 def evaluation_id(dataset_id, config):
@@ -104,6 +92,11 @@ class Backtester:
             for frame in market.values()
         ):
             raise ValueError("Every asset must share the same complete calendar.")
+        rate = getattr(market, "interest_rate", None)
+        if rate is not None:
+            validate_interest_rate(rate, market[config.benchmark].index)
+            rate = rate.copy(deep=True)
+            rate.index = pd.RangeIndex(-config.warmup_bars, length - config.warmup_bars)
         data = {}
         for symbol in set(tickers) | {config.benchmark}:
             frame = market[symbol].loc[:, list(COLUMNS)].copy()
@@ -166,6 +159,9 @@ class Backtester:
                 float(cash),
                 float(portfolio),
                 trader_data,
+                {}
+                if rate is None
+                else {INTEREST_RATE: rate.loc[:step].copy(deep=True)},
             )
             result = trader.run(state)
             orders, trader_data = (

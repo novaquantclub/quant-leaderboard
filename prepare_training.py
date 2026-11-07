@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from interest_rate import INTEREST_RATE, INTEREST_RATE_FILE, MarketData
 from synthetic_market import COLUMNS, calibrate_market
 
 
@@ -33,7 +34,10 @@ def repair_ohlc_roundoff(frame):
 def save_training(frames, destination, *, asset_names=None, source_info=None):
     """Save competition CSVs and separate organizer-only source provenance."""
     calibrate_market(frames)
-    frames = {symbol.strip().upper(): frame for symbol, frame in frames.items()}
+    frames = MarketData(
+        {symbol.strip().upper(): frame for symbol, frame in frames.items()},
+        interest_rate=getattr(frames, "interest_rate", None),
+    )
     symbols = sorted(frames)
     names = symbols.copy() if asset_names is None else list(asset_names)
     if asset_names is not None and (
@@ -58,6 +62,10 @@ def save_training(frames, destination, *, asset_names=None, source_info=None):
         for name, frame in public.items():
             frame.loc[:, list(COLUMNS)].to_csv(
                 public_dir / f"{name}.csv", index_label="Date"
+            )
+        if frames.interest_rate is not None:
+            frames.interest_rate.rename(INTEREST_RATE).to_csv(
+                public_dir / INTEREST_RATE_FILE, index_label="Date"
             )
         provenance = {
             "source": source_info or {},

@@ -19,7 +19,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-GENERATOR_VERSION = "synthetic-market-v1"
+from interest_rate import (
+    INTEREST_RATE,
+    INTEREST_RATE_FILE,
+    MarketData,
+    validate_interest_rate,
+)
+
+GENERATOR_VERSION = "synthetic-market-v2"
 COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 MIN_TRAINING_BARS = 120
 MAX_VALUES = 15_000_000
@@ -65,6 +72,37 @@ class MarketModel:
     @property
     def model_sha256(self):
         return _digest({"symbols": self.symbols, "parameters": self.parameters})
+
+
+def load_training(directory):
+    paths = sorted(
+        path
+        for path in Path(directory).glob("*.csv")
+        if path.name != INTEREST_RATE_FILE
+    )
+    frames = {
+        path.stem.strip().upper(): pd.read_csv(
+            path, index_col=0, float_precision="round_trip"
+        )
+        for path in paths
+    }
+    if len(frames) != len(paths):
+        raise ValueError("Duplicate training symbols.")
+    rate_path = Path(directory) / INTEREST_RATE_FILE
+    rate = None
+    if rate_path.exists():
+        data = pd.read_csv(rate_path, index_col=0, float_precision="round_trip")
+        if list(data.columns) != [INTEREST_RATE]:
+            raise ValueError(
+                "The interest rate CSV needs one annualized percent column named 'interest rate'."
+            )
+        rate = data[INTEREST_RATE]
+    market = MarketData(frames, interest_rate=rate)
+    calibrate_market(market)
+    return MarketData(
+        {symbol: frame.loc[:, list(COLUMNS)] for symbol, frame in market.items()},
+        interest_rate=rate,
+    )
 
 
 def calibrate_market(training: Mapping[str, pd.DataFrame]) -> MarketModel:
@@ -141,6 +179,13 @@ def calibrate_market(training: Mapping[str, pd.DataFrame]) -> MarketModel:
     )
     for symbol in symbols:
         source_hash.update(frames[symbol].to_numpy(dtype="<f8").tobytes(order="C"))
+    interest_rate = getattr(training, "interest_rate", None)
+    if interest_rate is not None:
+        validate_interest_rate(interest_rate, reference)
+        source_hash.update(
+            _json_bytes({"observation": INTEREST_RATE, "unit": "annualized percent"})
+        )
+        source_hash.update(interest_rate.to_numpy(dtype="<f8").tobytes())
 
     gaps, sessions, autoregression, wicks, volume_sigma = [], [], [], [], []
     for symbol in symbols:
@@ -179,17 +224,46 @@ def calibrate_market(training: Mapping[str, pd.DataFrame]) -> MarketModel:
     means = np.clip(
         means, -0.15 * np.sqrt(np.diag(covariance)), 0.15 * np.sqrt(np.diag(covariance))
     )
-    return MarketModel(
-        symbols,
-        {
-            "means": means.tolist(),
-            "covariance": covariance.tolist(),
-            "autoregression": autoregression,
-            "wicks": wicks,
-            "volume_sigma": volume_sigma,
-        },
-        source_hash.hexdigest(),
-    )
+    parameters = {
+        "means": means.tolist(),
+        "covariance": covariance.tolist(),
+        "autoregression": autoregression,
+        "wicks": wicks,
+        "volume_sigma": volume_sigma,
+    }
+    if interest_rate is not None:
+        rate = interest_rate.to_numpy(dtype=float)
+        level = float(rate.mean())
+        variance = np.var(rate[:-1], ddof=1)
+        phi = (
+            float(np.clip(np.cov(rate[:-1], rate[1:])[0, 1] / variance, 0, 0.9995))
+            if variance > 1e-12
+            else 0.0
+        )
+        residual = rate[1:] - (level + phi * (rate[:-1] - level))
+        joint = np.column_stack([observations, residual])
+        threshold = float(np.median(rate))
+        covariances = []
+        for mask in (rate[:-1] <= threshold, rate[:-1] > threshold):
+            sample = joint[mask] if mask.sum() >= max(40, 2 * joint.shape[1]) else joint
+            covariance = np.atleast_2d(np.cov(sample, rowvar=False))
+            covariance = 0.95 * covariance + 0.05 * np.diag(np.diag(covariance))
+            covariance += np.eye(len(covariance)) * 1e-10
+            covariances.append(covariance.tolist())
+        parameters["interest_rate"] = {
+            "mean": level,
+            "autoregression": phi,
+            "threshold": threshold,
+            "initial_quantiles": np.quantile(
+                rate, [0.1, 0.25, 0.5, 0.75, 0.9]
+            ).tolist(),
+            "bounds": [
+                float(min(0, rate.min())),
+                float(min(100, max(1, rate.max() + rate.std()))),
+            ],
+            "joint_covariances": covariances,
+        }
+    return MarketModel(symbols, parameters, source_hash.hexdigest())
 
 
 def _prices_hash(prices):
@@ -204,6 +278,7 @@ class SyntheticRound:
 
     prices: np.ndarray  # path, symbol, bar, OHLCV
     manifest: dict
+    interest_rates: np.ndarray | None = None
 
     @property
     def dataset_id(self):
@@ -223,7 +298,7 @@ class SyntheticRound:
         index = pd.RangeIndex(
             -config["warmup_bars"], config["evaluation_bars"], name="Step"
         )
-        return {
+        market = {
             symbol: pd.DataFrame(
                 self.prices[path_index, universe.index(symbol)].copy(),
                 index=index,
@@ -231,6 +306,14 @@ class SyntheticRound:
             )
             for symbol in selected
         }
+        rate = (
+            None
+            if self.interest_rates is None
+            else pd.Series(
+                self.interest_rates[path_index].copy(), index=index, name=INTEREST_RATE
+            )
+        )
+        return MarketData(market, interest_rate=rate)
 
     def save(self, destination, *, private_seed=None):
         """Publish a complete private bundle atomically, refusing to overwrite a round."""
@@ -245,7 +328,10 @@ class SyntheticRound:
             raise FileExistsError(f"A round already exists at {destination}.")
         temporary = Path(tempfile.mkdtemp(prefix=".synthetic-", dir=destination.parent))
         try:
-            np.savez_compressed(temporary / "prices.npz", prices=self.prices)
+            arrays = {"prices": self.prices}
+            if self.interest_rates is not None:
+                arrays["interest_rates"] = self.interest_rates
+            np.savez_compressed(temporary / "prices.npz", **arrays)
             (temporary / "manifest.json").write_bytes(_json_bytes(self.manifest))
             if private_seed is not None:
                 (temporary / "private_seed.json").write_bytes(
@@ -266,19 +352,25 @@ class SyntheticRound:
         manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
         with np.load(directory / "prices.npz", allow_pickle=False) as archive:
             prices = archive["prices"]
-        result = cls(prices, manifest)
+            rate = archive.get("interest_rates")
+        result = cls(prices, manifest, rate)
         _validate_round(result)
         if expected_dataset_id is not None and result.dataset_id != expected_dataset_id:
             raise ValueError(
                 "Synthetic dataset does not match the committed dataset ID."
             )
         result.prices.setflags(write=False)
+        if rate is not None:
+            rate.setflags(write=False)
         return result
 
 
 def _validate_round(round_data):
     manifest = round_data.manifest
-    if manifest.get("generator_version") != GENERATOR_VERSION:
+    if manifest.get("generator_version") not in (
+        "synthetic-market-v1",
+        GENERATOR_VERSION,
+    ):
         raise ValueError("Unsupported synthetic generator version.")
     config = SyntheticConfig(**manifest["config"])
     symbols = manifest["symbols"]
@@ -304,6 +396,23 @@ def _validate_round(round_data):
         raise ValueError("Synthetic snapshot has invalid OHLC ordering.")
     if manifest.get("prices_sha256") != _prices_hash(prices):
         raise ValueError("Synthetic snapshot hash does not match its manifest.")
+    rate = round_data.interest_rates
+    if rate is None:
+        if "interest_rate_sha256" in manifest:
+            raise ValueError("Synthetic interest-rate observations are missing.")
+    else:
+        if (
+            rate.shape != (config.paths, config.warmup_bars + config.evaluation_bars)
+            or rate.dtype.kind != "f"
+            or not np.isfinite(rate).all()
+            or (np.abs(rate) > 100).any()
+            or prices.size + rate.size > MAX_VALUES
+        ):
+            raise ValueError("Synthetic interest-rate observations are invalid.")
+        if manifest.get("interest_rate_sha256") != _prices_hash(rate):
+            raise ValueError(
+                "Synthetic interest-rate hash does not match its manifest."
+            )
 
 
 def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound:
@@ -318,9 +427,10 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
     config = config if config is not None else SyntheticConfig()
     assets = len(model.symbols)
     bars = config.warmup_bars + config.evaluation_bars
+    rate_model = model.parameters.get("interest_rate")
     if (
         not 1 <= assets <= 20
-        or config.paths * assets * bars * len(COLUMNS) > MAX_VALUES
+        or config.paths * bars * (assets * len(COLUMNS) + bool(rate_model)) > MAX_VALUES
     ):
         raise ValueError("Synthetic round exceeds the supported dataset size.")
     parameters = model.parameters
@@ -332,12 +442,21 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
     wicks = np.asarray(parameters["wicks"])
     volume_sigma = np.asarray(parameters["volume_sigma"])
     prices = np.empty((config.paths, assets, bars, len(COLUMNS)), dtype=float)
+    interest_rates = None
+    rate_factors = []
+    if rate_model is not None:
+        interest_rates = np.empty((config.paths, bars), dtype=float)
+        rate_factors = [
+            np.linalg.cholesky(matrix) for matrix in rate_model["joint_covariances"]
+        ]
     for path_index in range(config.paths):
         rng = np.random.default_rng(
             np.random.SeedSequence(seed, spawn_key=(path_index, 0))
         )
         previous_close = np.full(assets, 100.0)
         previous_return = means[:assets] + means[assets:]
+        if rate_model is not None:
+            previous_rate = float(rng.choice(rate_model["initial_quantiles"]))
         variance = 1.0
         stress = bool(rng.integers(2))
         for bar in range(bars):
@@ -346,9 +465,12 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
             regime_scale = (1.75 if stress else 0.75) / np.sqrt((1.75**2 + 0.75**2) / 2)
             # One radial draw gives multivariate t innovations with covariance
             # matching the fitted Gaussian covariance before volatility scaling.
-            innovation = (factor @ rng.standard_normal(2 * assets)) * np.sqrt(
+            if rate_model is not None:
+                factor = rate_factors[int(previous_rate > rate_model["threshold"])]
+            joint_innovation = (factor @ rng.standard_normal(len(factor))) * np.sqrt(
                 5 / rng.chisquare(7)
             )
+            innovation = joint_innovation[: 2 * assets]
             returns = means + np.sqrt(variance) * regime_scale * innovation
             returns[assets:] += phi * (
                 previous_return - means[:assets] - means[assets:]
@@ -360,6 +482,17 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
             prices[path_index, :, bar, 3] = close
             previous_close = close
             previous_return = returns[:assets] + returns[assets:]
+            if rate_model is not None:
+                previous_rate = float(
+                    np.clip(
+                        rate_model["mean"]
+                        + rate_model["autoregression"]
+                        * (previous_rate - rate_model["mean"])
+                        + joint_innovation[-1],
+                        *rate_model["bounds"],
+                    )
+                )
+                interest_rates[path_index, bar] = previous_rate
             standardized = innovation / scales
             variance = float(
                 np.clip(
@@ -418,9 +551,13 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
         "prices_sha256": _prices_hash(prices),
         "libraries": {"numpy": np.__version__, "pandas": pd.__version__},
     }
-    result = SyntheticRound(prices, manifest)
+    if interest_rates is not None:
+        manifest["interest_rate_sha256"] = _prices_hash(interest_rates)
+    result = SyntheticRound(prices, manifest, interest_rates)
     _validate_round(result)
     result.prices.setflags(write=False)
+    if interest_rates is not None:
+        interest_rates.setflags(write=False)
     return result
 
 
@@ -451,11 +588,7 @@ def main():
     args = parser.parse_args()
     seed = args.seed if args.seed is not None else secrets.randbits(128)
     try:
-        csvs = sorted(args.training_directory.glob("*.csv"))
-        training = {
-            path.stem: pd.read_csv(path, index_col=0, float_precision="round_trip")
-            for path in csvs
-        }
+        training = load_training(args.training_directory)
         model = calibrate_market(training)
         round_data = generate_round(
             model, seed, SyntheticConfig(args.paths, args.bars, args.warmup)
