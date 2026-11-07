@@ -43,6 +43,12 @@ code. Upgrading any of them requires checking compatibility and starting a new
 round or restoring the previous runtime; it must not silently change old scores.
 Restart the service whenever code or packages change.
 
+The client and worker negotiate incremental history updates. The guest receives
+the initial observation prefix and subsequent new rows, and reconstructs the
+complete available history for each strategy call. Update the worker files and
+restart the service when deploying this transport revision. Profile the full
+public practice dataset through the deployed HTTPS route against the session limits.
+
 Generate a random worker credential and place `NQC_WORKER_TOKEN=<value>` in
 `/etc/nqc-worker.env`, with root ownership and mode `0600`. Keep the token out of
 Git, command-line arguments, service URLs, and logs. Give the web app the same

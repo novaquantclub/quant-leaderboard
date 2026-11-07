@@ -16,6 +16,84 @@ from unittest.mock import patch
     "Streamlit UI checks run in the web app environment",
 )
 class AppTests(unittest.TestCase):
+    def test_blind_round_hides_results_until_published_and_renders_the_leaderboard(
+        self,
+    ):
+        from streamlit.testing.v1 import AppTest
+        from test_competition import BuyHold
+        from test_synthetic_market import training_fixture
+
+        from backtester import EngineConfig
+        from competition import Competition
+        from synthetic_market import SyntheticConfig
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            training = root / "training"
+            training.mkdir()
+            for symbol, frame in training_fixture(130).items():
+                frame.to_csv(training / f"{symbol}.csv", index_label="Date")
+            store = Competition(root / "league.db", root / "rounds")
+            round_id = store.create_round(
+                "UI rehearsal",
+                training,
+                EngineConfig(runtime_id="ui-test-runtime"),
+                SyntheticConfig(2, 20, 100),
+            )
+            token = store.create_team("UI team")
+            team = store.authenticate(token)
+            version = store.submit(
+                round_id,
+                team["id"],
+                "test source",
+                {"name": "UI strategy", "author": "UI author", "tickers": ["SPY"]},
+            )
+            store.select(round_id, team["id"], version)
+            with patch.dict(
+                os.environ,
+                {
+                    "DB_PATH": str(store.db_path),
+                    "ROUND_ROOT": str(store.round_root),
+                    "ADMIN_PASSWORD": "",
+                },
+            ):
+                app = AppTest.from_file(
+                    str(Path(__file__).resolve().parents[1] / "app.py"),
+                    default_timeout=20,
+                ).run()
+                self.assertFalse(app.exception)
+                self.assertEqual(len(app.dataframe), 0)
+                self.assertEqual(len(app.metric), 0)
+                self.assertEqual(
+                    len(app.get("vega_lite_chart"))
+                    + len(app.get("arrow_vega_lite_chart")),
+                    0,
+                )
+                store.lock_round(round_id)
+                store.score(
+                    round_id,
+                    runtime_id="ui-test-runtime",
+                    trader_factory=lambda source: BuyHold(),
+                )
+                app.run()
+                self.assertFalse(app.exception)
+                self.assertEqual(len(app.dataframe), 0)
+                self.assertEqual(
+                    len(app.get("vega_lite_chart"))
+                    + len(app.get("arrow_vega_lite_chart")),
+                    0,
+                )
+                store.publish(round_id)
+                app.run()
+                self.assertFalse(app.exception)
+                self.assertEqual(len(app.dataframe), 1)
+                self.assertEqual(
+                    len(app.get("vega_lite_chart"))
+                    + len(app.get("arrow_vega_lite_chart")),
+                    1,
+                )
+                self.assertEqual(app.dataframe[0].value.iloc[0]["Team"], "UI team")
+
     def test_extracted_sdk_runs_with_interest_rate_data(self):
         import pandas as pd
         from test_synthetic_market import training_fixture

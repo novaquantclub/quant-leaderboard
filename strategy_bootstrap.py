@@ -15,6 +15,81 @@ MAX_REPLY = 262_144
 MAX_STATE = 16_000_000
 
 
+class HistoryBuffer:
+    """Retain received observations and give each strategy call independent copies."""
+
+    def __init__(self):
+        self.start = None
+        self.length = 0
+        self.capacity = 0
+        self.arrays = {"history": {}, "observations": {}}
+
+    def restore(self, state):
+        first = state["history_start"]
+        update_start = state.pop("history_update_start", None)
+        incremental = update_start is not None
+        incoming = {
+            "history": state["history"],
+            "observations": state.get("observations", {}),
+        }
+        if incremental:
+            if (
+                first != self.start
+                or update_start != self.start + self.length
+                or any(
+                    set(incoming[group]) != set(self.arrays[group])
+                    for group in incoming
+                )
+            ):
+                raise ValueError(
+                    "History update must extend the previous observation prefix."
+                )
+        else:
+            self.start, self.length = first, 0
+            self.arrays = {"history": {}, "observations": {}}
+            update_start = first
+        count = state["step"] - update_start + 1
+        if count <= 0:
+            raise ValueError("History update needs at least one current observation.")
+        total = self.length + count
+        capacity = max(total, self.capacity, 128)
+        if total > self.capacity:
+            capacity = max(capacity, self.capacity * 2)
+        for group, values in incoming.items():
+            for name, rows in values.items():
+                shape = (count, 5) if group == "history" else (count,)
+                array = np.asarray(rows, dtype=float)
+                if array.shape != shape or not np.isfinite(array).all():
+                    raise ValueError(
+                        "History update has invalid observation dimensions or values."
+                    )
+                previous = self.arrays[group].get(name)
+                if previous is None or len(previous) < total:
+                    buffer = np.empty((capacity, *shape[1:]), dtype=float)
+                    if previous is not None:
+                        buffer[: self.length] = previous[: self.length]
+                    self.arrays[group][name] = buffer
+                self.arrays[group][name][self.length : total] = array
+        self.capacity, self.length = capacity, total
+        index = pd.RangeIndex(first, state["step"] + 1)
+        state["history"] = {
+            name: pd.DataFrame(
+                self.arrays["history"][name][:total].copy(),
+                columns=["Open", "High", "Low", "Close", "Volume"],
+                index=index,
+            )
+            for name in incoming["history"]
+        }
+        state["observations"] = {
+            name: pd.Series(
+                self.arrays["observations"][name][:total].copy(), index=index, name=name
+            )
+            for name in incoming["observations"]
+        }
+        state.pop("history_start")
+        return state
+
+
 def main():
     # This public strategy seed is independent of the private market seed.
     random.seed(0)
@@ -43,31 +118,14 @@ def main():
                 "tickers": list(trader.tickers),
             }
         )
+        history = HistoryBuffer()
         while True:
             line = sys.stdin.buffer.readline(MAX_STATE + 1)
             if not line:
                 return
             if len(line) > MAX_STATE:
                 raise ValueError("State exceeds the size limit.")
-            state = json.loads(line)
-            state["history"] = {
-                symbol: pd.DataFrame(
-                    values,
-                    columns=["Open", "High", "Low", "Close", "Volume"],
-                    index=pd.RangeIndex(state["history_start"], state["step"] + 1),
-                )
-                for symbol, values in state["history"].items()
-            }
-            state["observations"] = {
-                name: pd.Series(
-                    values,
-                    name=name,
-                    dtype=float,
-                    index=pd.RangeIndex(state["history_start"], state["step"] + 1),
-                )
-                for name, values in state.get("observations", {}).items()
-            }
-            state.pop("history_start")
+            state = history.restore(json.loads(line))
             result = trader.run(SimpleNamespace(**state))
             orders, trader_data = (
                 result

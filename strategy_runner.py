@@ -334,7 +334,14 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     session = self.server.factory(body.get("source"))
                     key = secrets.token_urlsafe(24)
                     self.server.sessions[key] = session
-                self._reply(200, {"session": key, "metadata": session.metadata})
+                self._reply(
+                    200,
+                    {
+                        "session": key,
+                        "metadata": session.metadata,
+                        "history_updates": True,
+                    },
+                )
                 return
             match = re.fullmatch(
                 r"/sessions/([A-Za-z0-9_-]{32})/(step|close)", self.path
@@ -386,6 +393,9 @@ class RemoteTrader:
         if len(token) < 32:
             raise StrategyError("Configure the worker API token.")
         self.token, self.session = token, None
+        self.history_updates = False
+        self.history_start = self.history_step = None
+        self.history_fingerprints = {}
         connection = (
             http.client.HTTPSConnection
             if url.scheme == "https"
@@ -397,6 +407,7 @@ class RemoteTrader:
         try:
             result = self._request("/sessions", {"source": source})
             self.session = result["session"]
+            self.history_updates = result.get("history_updates") is True
             self.metadata = validate_metadata(result["metadata"])
             self.name, self.author, self.tickers = (
                 self.metadata[key] for key in ("name", "author", "tickers")
@@ -432,26 +443,59 @@ class RemoteTrader:
         except (OSError, http.client.HTTPException, ValueError, KeyError) as exc:
             raise StrategyError("Cannot communicate with the strategy worker.") from exc
 
+    @staticmethod
+    def _fingerprints(groups, length=None):
+        return {
+            (group, name): hashlib.sha256(values[:length].tobytes()).digest()
+            for group, arrays in groups.items()
+            for name, values in arrays.items()
+        }
+
     def run(self, state):
+        first = int(next(iter(state.history.values())).index[0])
+        arrays = {
+            "history": {
+                name: frame.to_numpy(dtype=float)
+                for name, frame in state.history.items()
+            },
+            "observations": {
+                name: series.to_numpy(dtype=float)
+                for name, series in getattr(state, "observations", {}).items()
+            },
+        }
+        incremental = (
+            self.history_updates
+            and self.history_start == first
+            and self.history_step is not None
+            and state.step > self.history_step
+            and self._fingerprints(arrays, self.history_step - first + 1)
+            == self.history_fingerprints
+        )
+        offset = self.history_step - first + 1 if incremental else 0
         payload = {
             "step": state.step,
-            "history_start": int(next(iter(state.history.values())).index[0]),
+            "history_start": first,
             "history": {
-                symbol: frame.to_numpy().tolist()
-                for symbol, frame in state.history.items()
+                name: values[offset:].tolist()
+                for name, values in arrays["history"].items()
             },
             "positions": state.positions,
             "cash": state.cash,
             "portfolio_value": state.portfolio_value,
             "trader_data": state.trader_data,
             "observations": {
-                name: series.to_numpy().tolist()
-                for name, series in getattr(state, "observations", {}).items()
+                name: values[offset:].tolist()
+                for name, values in arrays["observations"].items()
             },
         }
-        return validate_orders(
+        if incremental:
+            payload["history_update_start"] = self.history_step + 1
+        result = validate_orders(
             self._request(f"/sessions/{self.session}/step", payload), self.tickers
         )
+        self.history_start, self.history_step = first, state.step
+        self.history_fingerprints = self._fingerprints(arrays)
+        return result
 
     def close(self):
         try:
