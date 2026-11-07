@@ -8,39 +8,16 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
-import numpy as np
 import pandas as pd
 from pandas.tseries.holiday import USFederalHolidayCalendar
 from pandas.tseries.offsets import CustomBusinessDay
 
-INTEREST_RATE = "interest rate"
-INTEREST_RATE_FILE = "interest rate.csv"
-
-
-class MarketData(dict):
-    """Tradable asset frames plus an optional observed interest-rate series."""
-
-    def __init__(self, assets, *, interest_rate=None):
-        super().__init__(assets)
-        self.interest_rate = interest_rate
-
-
-def validate_interest_rate(series, index):
-    if (
-        not isinstance(series, pd.Series)
-        or not series.index.equals(index)
-        or not series.index.is_unique
-        or not series.index.is_monotonic_increasing
-        or series.index.hasnans
-    ):
-        raise ValueError(
-            "Interest rate must share the complete ordered asset calendar."
-        )
-    values = series.to_numpy(dtype=float)
-    if not np.isfinite(values).all() or (np.abs(values) > 100).any():
-        raise ValueError(
-            "Interest rate must contain finite annualized percentages between -100 and 100."
-        )
+from market_data import (
+    INTEREST_RATE,
+    INTEREST_RATE_FILE,  # noqa: F401 - preserve the public import path
+    MarketData,
+    validate_interest_rate,
+)
 
 
 def align_interest_rate(source, asset_index):

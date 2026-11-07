@@ -153,7 +153,18 @@ def main():
                 st.info(
                     "Enter your team token to run an online backtest. You can also test your own code locally using the SDK."
                 )
-            if st.button("Run practice backtest", disabled=not team):
+            if current["phase"] != "open":
+                st.info(
+                    "Online practice runs during the open submission phase. Use the downloaded package for local backtesting."
+                )
+            if (
+                st.button(
+                    "Run practice backtest",
+                    disabled=not team or current["phase"] != "open",
+                )
+                and team
+                and current["phase"] == "open"
+            ):
                 try:
                     with st.spinner("Running your strategy on the public dataset..."):
                         config = EngineConfig(**json.loads(current["config"]))

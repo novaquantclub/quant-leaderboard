@@ -153,6 +153,10 @@ Extract the ZIP into a separate folder and open its `.code-workspace` file.
 The member README supplies the strategy interface and pilot rules. Teams develop
 their own `strategy.py` and record their research and validation in `RESULTS.md`.
 The same package is available from the app's Guide tab for a prepared round.
+Its support modules cover the public data schema and execution engine. The
+organizer's synthetic generator and private random-stream implementation are
+excluded from member ZIPs. Generator assumptions and source remain reviewable
+in this repository. Final-path privacy relies on isolation and secret draws.
 
 ## Hosting and isolation
 
@@ -173,6 +177,14 @@ private dataset, seed, and future bars are never sent to it or mounted into the
 guest. The guest has a read-only filesystem, separate process/network/user
 namespaces, no network sockets, and CPU, memory, process, output, and time limits.
 Unsupported or unavailable isolation causes evaluation to fail closed.
+The worker verifies its native isolation policy before opening its listener.
+Final scoring pins the runtime for every path. Supporting engine-module changes
+also change the evaluation identity.
+
+Online practice closes when submissions lock. With the default two-session
+worker, practice can occupy one session and final grading has reserved capacity.
+Worker overload, connection failures, and runtime drift leave grading pending.
+The round returns to its locked state for a retry, preserving completed teams.
 
 ## Environment variables
 
@@ -210,6 +222,8 @@ uncertainty conditional on the model; it does not include model error. Inspect
 the model's realism and baseline strategies on the actual public dataset before
 running a competition. See [SYNTHETIC_ROUNDS.md](SYNTHETIC_ROUNDS.md) and
 [REVIEW_RESPONSE.md](REVIEW_RESPONSE.md).
+The infrastructure audit, reproduced defects, and calibration stress results are
+recorded in [FORWARD_TEST_AUDIT.md](FORWARD_TEST_AUDIT.md).
 
 ## Verification
 

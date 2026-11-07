@@ -69,6 +69,18 @@ class AppTests(unittest.TestCase):
                     + len(app.get("arrow_vega_lite_chart")),
                     0,
                 )
+                next(
+                    field
+                    for field in app.text_input
+                    if field.label == "Team access token"
+                ).set_value(token).run()
+                self.assertFalse(
+                    next(
+                        button
+                        for button in app.button
+                        if button.label == "Run practice backtest"
+                    ).disabled
+                )
                 store.lock_round(round_id)
                 store.score(
                     round_id,
@@ -77,6 +89,13 @@ class AppTests(unittest.TestCase):
                 )
                 app.run()
                 self.assertFalse(app.exception)
+                self.assertTrue(
+                    next(
+                        button
+                        for button in app.button
+                        if button.label == "Run practice backtest"
+                    ).disabled
+                )
                 self.assertEqual(len(app.dataframe), 0)
                 self.assertEqual(
                     len(app.get("vega_lite_chart"))

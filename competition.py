@@ -16,7 +16,8 @@ from backtester import Backtester, EngineConfig, evaluation_id, load_training
 from interest_rate import INTEREST_RATE_FILE
 from strategy_runner import (
     MAX_SOURCE,
-    RemoteTrader,
+    StrategyError,
+    WorkerError,
     validate_metadata,
     worker_runtime_id,
 )
@@ -370,9 +371,7 @@ class Competition:
             ).rowcount:
                 raise CompetitionError("This round is already locked.")
 
-    def score(
-        self, round_id, *, runtime_id=None, trader_factory=RemoteTrader, progress=None
-    ):
+    def score(self, round_id, *, runtime_id=None, trader_factory=None, progress=None):
         row = self.round(round_id)
         config = EngineConfig(**json.loads(row["config"]))
         current_runtime = runtime_id if runtime_id is not None else worker_runtime_id()
@@ -385,7 +384,7 @@ class Competition:
         )
         if evaluation_id(dataset.dataset_id, config) != row["evaluation_id"]:
             raise CompetitionError(
-                "Engine settings changed; this round cannot be silently re-scored."
+                "Engine code or settings changed. Restore this round's pinned evaluation environment."
             )
         lease, now = uuid.uuid4().hex, time.time()
         with self.db(write=True) as db:
@@ -411,47 +410,58 @@ class Competition:
                     (round_id,),
                 )
             ]
-        engine = Backtester(config)
-        for index, job in enumerate(jobs):
-            if progress:
-                progress(index, len(jobs), job["name"])
-            with self.db(write=True) as db:
-                if not db.execute(
-                    "UPDATE competition_rounds SET lease_until=? WHERE id=? AND lease=?",
-                    (
-                        time.time() + dataset.manifest["config"]["paths"] * 46 + 60,
-                        round_id,
-                        lease,
-                    ),
-                ).rowcount:
-                    raise CompetitionError("Evaluation lease was lost.")
-            result, error = None, None
-            try:
-                result = json.dumps(
-                    engine.run_synthetic(
-                        job["source"], dataset, trader_factory=trader_factory
-                    ),
-                    allow_nan=False,
-                )
-            except Exception as exc:  # noqa: BLE001 - isolate failures to one team's final entry
-                error = f"{type(exc).__name__}: {str(exc)[:600]}"
-            with self.db(write=True) as db:
-                if (
+        try:
+            engine = Backtester(config)
+            for index, job in enumerate(jobs):
+                if progress:
+                    progress(index, len(jobs), job["name"])
+                with self.db(write=True) as db:
+                    if not db.execute(
+                        "UPDATE competition_rounds SET lease_until=? WHERE id=? AND lease=?",
+                        (
+                            time.time() + dataset.manifest["config"]["paths"] * 46 + 60,
+                            round_id,
+                            lease,
+                        ),
+                    ).rowcount:
+                        raise CompetitionError("Evaluation lease was lost.")
+                result, error = None, None
+                try:
+                    result = json.dumps(
+                        engine.run_synthetic(
+                            job["source"], dataset, trader_factory=trader_factory
+                        ),
+                        allow_nan=False,
+                    )
+                except WorkerError:
+                    raise
+                except StrategyError as exc:
+                    error = f"{type(exc).__name__}: {str(exc)[:600]}"
+                with self.db(write=True) as db:
+                    if (
+                        db.execute(
+                            "SELECT lease FROM competition_rounds WHERE id=?",
+                            (round_id,),
+                        ).fetchone()[0]
+                        != lease
+                    ):
+                        raise CompetitionError("Evaluation lease was lost.")
                     db.execute(
-                        "SELECT lease FROM competition_rounds WHERE id=?", (round_id,)
-                    ).fetchone()[0]
-                    != lease
-                ):
-                    raise CompetitionError("Evaluation lease was lost.")
+                        "UPDATE selections SET result=?,error=? WHERE round_id=? AND team_id=?",
+                        (result, error, round_id, job["team_id"]),
+                    )
+            with self.db(write=True) as db:
                 db.execute(
-                    "UPDATE selections SET result=?,error=? WHERE round_id=? AND team_id=?",
-                    (result, error, round_id, job["team_id"]),
+                    "UPDATE competition_rounds SET phase='scored',lease=NULL,lease_until=NULL WHERE id=? AND lease=?",
+                    (round_id, lease),
                 )
-        with self.db(write=True) as db:
-            db.execute(
-                "UPDATE competition_rounds SET phase='scored',lease=NULL,lease_until=NULL WHERE id=? AND lease=?",
-                (round_id, lease),
-            )
+        except BaseException:
+            with self.db(write=True) as db:
+                db.execute(
+                    "UPDATE competition_rounds SET phase='locked',lease=NULL,lease_until=NULL WHERE id=? AND lease=?",
+                    (round_id, lease),
+                )
+            raise
 
     def publish(self, round_id):
         with self.db(write=True) as db:

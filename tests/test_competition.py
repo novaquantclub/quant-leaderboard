@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -10,6 +11,7 @@ from test_synthetic_market import training_fixture
 
 from backtester import Backtester, EngineConfig, evaluation_id
 from competition import Competition, CompetitionError
+from strategy_runner import StrategyError, WorkerBusyError, WorkerError
 
 
 class BuyHold:
@@ -26,6 +28,27 @@ class BuyHold:
 
 
 class EngineTests(unittest.TestCase):
+    def test_supporting_module_changes_invalidate_the_evaluation_identity(self):
+        base = evaluation_id("dataset-one", EngineConfig())
+        original = Path.read_text
+        for name in (
+            "market_data.py",
+            "synthetic_market.py",
+            "secure_random.py",
+            "strategy_runner.py",
+        ):
+
+            def revised(path, *args, module_name=name, **kwargs):
+                text = original(path, *args, **kwargs)
+                return (
+                    text + "\n# changed support module\n"
+                    if path.name == module_name
+                    else text
+                )
+
+            with self.subTest(module=name), patch.object(Path, "read_text", revised):
+                self.assertNotEqual(base, evaluation_id("dataset-one", EngineConfig()))
+
     def test_buy_hold_has_identical_opportunities_and_costs_to_benchmark(self):
         result = Backtester().run_dataset(BuyHold(), training_fixture(130))
         pd.testing.assert_series_equal(
@@ -54,7 +77,7 @@ class EngineTests(unittest.TestCase):
         market["SPY"] = market["SPY"].iloc[1:]
         with self.assertRaises(ValueError):
             Backtester().run_dataset(BuyHold(), market)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(StrategyError):
             Backtester().run_dataset(BuyHold(), {"QQQ": market["QQQ"]})
 
     def test_all_engine_settings_affect_evaluation_identity(self):
@@ -74,6 +97,31 @@ class EngineTests(unittest.TestCase):
                     evaluation_id("dataset-one", replace(config, **{field: value})),
                 )
         self.assertNotEqual(base, evaluation_id("dataset-two", config))
+
+    def test_each_final_path_pins_runtime_and_checks_it_again_after_evaluation(self):
+        from synthetic_market import SyntheticConfig, calibrate_market, generate_round
+
+        dataset = generate_round(
+            calibrate_market(training_fixture(130)), 12, SyntheticConfig(2, 15, 100)
+        )
+        engine = Backtester(EngineConfig(runtime_id="pinned-test-runtime"))
+        with (
+            patch("backtester.RemoteTrader", return_value=BuyHold()) as factory,
+            patch("backtester.worker_runtime_id", return_value="pinned-test-runtime"),
+        ):
+            engine.run_synthetic("source", dataset)
+            self.assertEqual(factory.call_count, 2)
+            for call in factory.call_args_list:
+                self.assertEqual(
+                    call.kwargs,
+                    {"purpose": "final", "expected_runtime_id": "pinned-test-runtime"},
+                )
+        with (
+            patch("backtester.RemoteTrader", return_value=BuyHold()),
+            patch("backtester.worker_runtime_id", return_value="changed-test-runtime"),
+            self.assertRaises(WorkerError),
+        ):
+            engine.run_synthetic("source", dataset)
 
     def test_non_finite_orders_are_rejected(self):
         class BadOrders(BuyHold):
@@ -285,7 +333,7 @@ class CompetitionTests(unittest.TestCase):
         self.store.lock_round(self.round_id)
 
         def fail(source):
-            raise RuntimeError("Bad strategy")
+            raise StrategyError("Bad strategy")
 
         self.store.score(self.round_id, runtime_id="test-worker", trader_factory=fail)
         self.assertEqual(self.store.results(self.round_id), [])
@@ -299,6 +347,109 @@ class CompetitionTests(unittest.TestCase):
             trader_factory=lambda source: BuyHold(),
         )
         self.assertIsNone(self.store.results(self.round_id, organizer=True)[0]["error"])
+
+    def test_strategy_changing_its_declared_universe_is_a_member_error(self):
+        version = self.submit()
+        self.store.select(self.round_id, self.team_a["id"], version)
+        self.store.lock_round(self.round_id)
+
+        class ChangedUniverse(BuyHold):
+            tickers = ("UNKNOWN",)
+
+        self.store.score(
+            self.round_id,
+            runtime_id="test-worker",
+            trader_factory=lambda source: ChangedUniverse(),
+        )
+        self.assertEqual(self.store.round(self.round_id)["phase"], "scored")
+        self.assertIn(
+            "StrategyError",
+            self.store.results(self.round_id, organizer=True)[0]["error"],
+        )
+
+    def test_busy_worker_keeps_results_pending_and_the_round_retryable(self):
+        version = self.submit()
+        self.store.select(self.round_id, self.team_a["id"], version)
+        self.store.lock_round(self.round_id)
+
+        def busy(source):
+            raise WorkerBusyError("Worker is busy.")
+
+        with self.assertRaises(WorkerBusyError):
+            self.store.score(
+                self.round_id, runtime_id="test-worker", trader_factory=busy
+            )
+        row = self.store.round(self.round_id)
+        self.assertEqual(row["phase"], "locked")
+        self.assertIsNone(row["lease"])
+        result = self.store.results(self.round_id, organizer=True)[0]
+        self.assertIsNone(result["result"])
+        self.assertIsNone(result["error"])
+        with self.assertRaises(CompetitionError):
+            self.store.publish(self.round_id)
+        self.store.score(
+            self.round_id,
+            runtime_id="test-worker",
+            trader_factory=lambda source: BuyHold(),
+        )
+        self.store.publish(self.round_id)
+        self.assertIsNotNone(self.store.results(self.round_id)[0]["result"])
+
+    def test_controller_error_releases_lease_and_preserves_pending_selection(self):
+        version = self.submit()
+        self.store.select(self.round_id, self.team_a["id"], version)
+        self.store.lock_round(self.round_id)
+
+        def controller_error(source):
+            raise ValueError("Controller failure.")
+
+        with self.assertRaisesRegex(ValueError, "Controller failure"):
+            self.store.score(
+                self.round_id, runtime_id="test-worker", trader_factory=controller_error
+            )
+        self.assertEqual(self.store.round(self.round_id)["phase"], "locked")
+        self.assertIsNone(self.store.results(self.round_id, organizer=True)[0]["error"])
+
+    def test_interrupted_grading_preserves_completed_teams_and_resumes_pending_work(
+        self,
+    ):
+        for team in (self.team_a, self.team_b):
+            version = self.submit(team=team)
+            self.store.select(self.round_id, team["id"], version)
+        self.store.lock_round(self.round_id)
+        calls = []
+
+        def interrupted(source):
+            calls.append(source)
+            if len(calls) > 2:
+                raise WorkerBusyError("Worker is busy.")
+            return BuyHold()
+
+        with self.assertRaises(WorkerBusyError):
+            self.store.score(
+                self.round_id, runtime_id="test-worker", trader_factory=interrupted
+            )
+        rows = self.store.results(self.round_id, organizer=True)
+        completed = next(row for row in rows if row["result"])
+        self.assertEqual(sum(row["result"] is not None for row in rows), 1)
+        self.assertTrue(all(row["error"] is None for row in rows))
+        self.assertEqual(self.store.round(self.round_id)["phase"], "locked")
+        calls.clear()
+
+        def resumed(source):
+            calls.append(source)
+            return BuyHold()
+
+        self.store.score(
+            self.round_id, runtime_id="test-worker", trader_factory=resumed
+        )
+        self.assertEqual(len(calls), 2)
+        after = self.store.results(self.round_id, organizer=True)
+        self.assertEqual(
+            next(row for row in after if row["team"] == completed["team"])["result"],
+            completed["result"],
+        )
+        self.assertTrue(all(row["result"] for row in after))
 
 
 if __name__ == "__main__":

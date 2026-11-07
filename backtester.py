@@ -5,16 +5,26 @@ import hashlib
 import importlib.util
 import json
 from dataclasses import asdict, dataclass, field, replace
+from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 
-from interest_rate import INTEREST_RATE, validate_interest_rate
-from strategy_runner import RemoteTrader, validate_orders
-from synthetic_market import COLUMNS, SyntheticRound, load_training
+from market_data import COLUMNS, INTEREST_RATE, load_training, validate_interest_rate
+from strategy_runner import (
+    RemoteTrader,
+    StrategyError,
+    WorkerError,
+    validate_orders,
+    worker_runtime_id,
+)
 
-ENGINE_VERSION = "streamed-next-open-v4"
+if TYPE_CHECKING:
+    from synthetic_market import SyntheticRound
+
+ENGINE_VERSION = "streamed-next-open-v5"
 WARMUP_BARS = 100
 
 
@@ -59,6 +69,19 @@ def evaluation_id(dataset_id, config):
         "engine_code": hashlib.sha256(
             Path(__file__).read_text(encoding="utf-8").encode()
         ).hexdigest(),
+        "support_code": {
+            name: hashlib.sha256(
+                Path(__file__).with_name(name).read_text(encoding="utf-8").encode()
+            ).hexdigest()
+            if Path(__file__).with_name(name).is_file()
+            else None
+            for name in (
+                "market_data.py",
+                "synthetic_market.py",
+                "secure_random.py",
+                "strategy_runner.py",
+            )
+        },
         "dataset_id": dataset_id,
         "settings": asdict(config),
         "ranking": "median-sharpe",
@@ -78,7 +101,7 @@ class Backtester:
         config = self.config
         tickers = list(trader.tickers)
         if not tickers or len(tickers) > 20 or set(tickers) - set(market):
-            raise ValueError(
+            raise StrategyError(
                 "Strategy tickers must belong to this round's fixed asset universe."
             )
         if config.benchmark not in market:
@@ -234,17 +257,27 @@ class Backtester:
             return self.run_dataset(trader, market)
 
     def run_synthetic(
-        self, source, round_data: SyntheticRound, *, trader_factory=RemoteTrader
+        self, source, round_data: "SyntheticRound", *, trader_factory=None
     ):
         if round_data.manifest["config"]["warmup_bars"] != self.config.warmup_bars:
             raise ValueError("Engine and snapshot warm-up settings differ.")
         curves, metrics = [], []
+        pinned_runtime = (
+            self.config.runtime_id
+            if trader_factory is None and self.config.runtime_id != "trusted-local"
+            else None
+        )
+        trader_factory = trader_factory or partial(
+            RemoteTrader, purpose="final", expected_runtime_id=pinned_runtime
+        )
         for path_index in range(round_data.manifest["config"]["paths"]):
             with trader_factory(source) as trader:
                 result = self.run_dataset(trader, round_data.path(path_index))
             curves.append(result.pop("equity_df"))
             result.pop("tickers")
             metrics.append(result)
+        if pinned_runtime is not None and worker_runtime_id() != pinned_runtime:
+            raise WorkerError("Worker runtime changed during final evaluation.")
         values = np.array([result["sharpe"] for result in metrics])
         bootstrap = np.random.default_rng(0).choice(values, size=(2000, len(values)))
         confidence = np.quantile(np.median(bootstrap, axis=1), [0.025, 0.975])

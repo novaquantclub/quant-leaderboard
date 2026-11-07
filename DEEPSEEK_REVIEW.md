@@ -131,3 +131,7 @@ contents.
 Native execution was tested locally on Linux/WSL over authenticated loopback HTTP.
 The actual Coolify host requires its own isolation, resource, and HTTPS latency
 checks during deployment.
+
+The follow-up [infrastructure audit](FORWARD_TEST_AUDIT.md) introduces generator
+v3 and engine v5. The synthetic numbers above refer to the earlier v2 frozen
+bundles. Regenerating with the same numeric seed under v3 produces new paths.

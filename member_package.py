@@ -9,8 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from backtester import EngineConfig
-from interest_rate import INTEREST_RATE_FILE
-from synthetic_market import load_training
+from market_data import INTEREST_RATE_FILE, load_training
 
 
 def sdk_zip(tickers=None, benchmark="ATLAS", config=None):
@@ -25,8 +24,7 @@ def sdk_zip(tickers=None, benchmark="ATLAS", config=None):
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for name in (
             "backtester.py",
-            "synthetic_market.py",
-            "interest_rate.py",
+            "market_data.py",
             "strategy_runner.py",
             "sample_strategy.py",
         ):

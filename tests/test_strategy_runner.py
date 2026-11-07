@@ -16,6 +16,8 @@ from strategy_runner import (
     RemoteTrader,
     SandboxProcess,
     StrategyError,
+    WorkerBusyError,
+    WorkerError,
     WorkerServer,
     validate_metadata,
     validate_orders,
@@ -89,10 +91,80 @@ class WorkerProtocolTests(unittest.TestCase):
     def test_capacity_is_bounded(self):
         with (
             RemoteTrader(SOURCE, endpoint=self.endpoint, token=self.token),
-            RemoteTrader(SOURCE, endpoint=self.endpoint, token=self.token),
+            RemoteTrader(
+                SOURCE, endpoint=self.endpoint, token=self.token, purpose="final"
+            ),
             self.assertRaisesRegex(StrategyError, "busy"),
         ):
             RemoteTrader(SOURCE, endpoint=self.endpoint, token=self.token)
+
+    def test_practice_cannot_consume_the_reserved_final_slot(self):
+        with RemoteTrader(SOURCE, endpoint=self.endpoint, token=self.token):
+            with self.assertRaises(WorkerBusyError):
+                RemoteTrader(SOURCE, endpoint=self.endpoint, token=self.token)
+            with RemoteTrader(
+                SOURCE, endpoint=self.endpoint, token=self.token, purpose="final"
+            ):
+                self.assertEqual(len(self.server.sessions), 2)
+
+    def test_runtime_requires_verified_native_isolation(self):
+        from strategy_runner import worker_runtime_id
+
+        with (
+            patch.dict(
+                os.environ,
+                {"NQC_WORKER_URL": self.endpoint, "NQC_WORKER_TOKEN": self.token},
+            ),
+            self.assertRaisesRegex(WorkerError, "verify native isolation"),
+        ):
+            worker_runtime_id()
+
+    def test_final_session_rejects_a_different_runtime_before_launching_code(self):
+        with self.assertRaisesRegex(WorkerError, "frozen round"):
+            RemoteTrader(
+                SOURCE,
+                endpoint=self.endpoint,
+                token=self.token,
+                purpose="final",
+                expected_runtime_id="0" * 64,
+            )
+        self.assertEqual(self.server.sessions, {})
+        with RemoteTrader(
+            SOURCE,
+            endpoint=self.endpoint,
+            token=self.token,
+            purpose="final",
+            expected_runtime_id=self.server.runtime_id,
+        ):
+            self.assertEqual(len(self.server.sessions), 1)
+
+    def test_runtime_file_or_package_drift_requires_a_service_restart(self):
+        with (
+            patch("strategy_runner.runtime_fingerprint", return_value="1" * 64),
+            self.assertRaisesRegex(WorkerError, "Restart the service"),
+        ):
+            RemoteTrader(SOURCE, endpoint=self.endpoint, token=self.token)
+        self.assertEqual(self.server.sessions, {})
+
+    def test_worker_os_failure_is_retryable(self):
+        with (
+            patch.object(
+                self.server, "factory", side_effect=OSError("Cannot start worker")
+            ),
+            self.assertRaises(WorkerError),
+        ):
+            RemoteTrader(SOURCE, endpoint=self.endpoint, token=self.token)
+        self.assertEqual(self.server.sessions, {})
+
+    def test_server_startup_fails_when_native_verification_fails(self):
+        with (
+            patch(
+                "strategy_runner.verify_sandbox",
+                side_effect=WorkerError("Isolation unavailable"),
+            ),
+            self.assertRaises(WorkerError),
+        ):
+            WorkerServer(("127.0.0.1", 0), self.token)
 
     def test_non_finite_and_oversized_results_are_rejected(self):
         for quantity in (True, float("nan"), float("inf"), "1"):
@@ -143,6 +215,54 @@ class NativeSandboxTests(unittest.TestCase):
         state["observations"] = {"interest rate": [5.25] * 101}
         result = self.sandbox(source).run(state)
         self.assertEqual(result["trader_data"], "(101, 5.25)")
+
+    def test_future_price_volume_and_rate_changes_are_invisible_until_released(self):
+        import pandas as pd
+
+        from backtester import Backtester
+        from market_data import MarketData
+
+        source = SOURCE[: SOURCE.index("    def run")]
+        source += """    def run(self, state):
+        import hashlib, json
+        values = [state.history['SPY'].values.tolist(), state.observations['interest rate'].tolist()]
+        return {}, hashlib.sha256(json.dumps(values).encode()).hexdigest()
+"""
+        frame = training_fixture(130)["SPY"]
+        rate = pd.Series([5.25] * len(frame), index=frame.index, name="interest rate")
+        changed_frame, changed_rate = frame.copy(), rate.copy()
+        changed_frame.iloc[111:, :4] *= 1.7
+        changed_frame.iloc[111:, 4] *= 2
+        changed_rate.iloc[111:] = 1.25
+        server = WorkerServer(("127.0.0.1", 0), "native-test-token-" * 3)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            digests = []
+
+            class ObservedTrader(RemoteTrader):
+                def run(self, state):
+                    result = super().run(state)
+                    digests[-1].append(result[1])
+                    return result
+
+            for prices, rates in ((frame, rate), (changed_frame, changed_rate)):
+                digests.append([])
+                Backtester().run_public(
+                    source,
+                    MarketData({"SPY": prices}, interest_rate=rates),
+                    trader_factory=lambda code: ObservedTrader(
+                        code,
+                        endpoint=f"http://127.0.0.1:{server.server_port}",
+                        token=server.token,
+                    ),
+                )
+            self.assertEqual(digests[0][:11], digests[1][:11])
+            self.assertNotEqual(digests[0][11], digests[1][11])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_host_files_environment_network_writes_and_fork_are_blocked(self):
         with tempfile.TemporaryDirectory() as directory:

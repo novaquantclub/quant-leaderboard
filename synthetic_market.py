@@ -8,7 +8,6 @@ This module never loads or executes participant strategies.
 import argparse
 import hashlib
 import json
-import re
 import secrets
 import shutil
 import tempfile
@@ -19,16 +18,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from interest_rate import (
+from market_data import (
+    COLUMNS,
     INTEREST_RATE,
-    INTEREST_RATE_FILE,
+    MIN_TRAINING_BARS,  # noqa: F401 - preserve the public import path
     MarketData,
+    load_training,
     validate_interest_rate,
+    validate_market,
 )
+from secure_random import RANDOMNESS_VERSION, SecureRandom
 
-GENERATOR_VERSION = "synthetic-market-v2"
-COLUMNS = ("Open", "High", "Low", "Close", "Volume")
-MIN_TRAINING_BARS = 120
+GENERATOR_VERSION = "synthetic-market-v3"
 MAX_VALUES = 15_000_000
 
 
@@ -74,100 +75,15 @@ class MarketModel:
         return _digest({"symbols": self.symbols, "parameters": self.parameters})
 
 
-def load_training(directory):
-    paths = sorted(
-        path
-        for path in Path(directory).glob("*.csv")
-        if path.name != INTEREST_RATE_FILE
-    )
-    frames = {
-        path.stem.strip().upper(): pd.read_csv(
-            path, index_col=0, float_precision="round_trip"
-        )
-        for path in paths
-    }
-    if len(frames) != len(paths):
-        raise ValueError("Duplicate training symbols.")
-    rate_path = Path(directory) / INTEREST_RATE_FILE
-    rate = None
-    if rate_path.exists():
-        data = pd.read_csv(rate_path, index_col=0, float_precision="round_trip")
-        if list(data.columns) != [INTEREST_RATE]:
-            raise ValueError(
-                "The interest rate CSV needs one annualized percent column named 'interest rate'."
-            )
-        rate = data[INTEREST_RATE]
-    market = MarketData(frames, interest_rate=rate)
-    calibrate_market(market)
-    return MarketData(
-        {symbol: frame.loc[:, list(COLUMNS)] for symbol, frame in market.items()},
-        interest_rate=rate,
-    )
-
-
 def calibrate_market(training: Mapping[str, pd.DataFrame]) -> MarketModel:
     """Fit aggregate statistics from the exact public dataset given to teams.
 
     Symbols must share a complete, ordered calendar: filling missing data here
     would silently change the training sample or introduce future observations.
     """
-    if not 1 <= len(training) <= 20:
-        raise ValueError("Provide a fixed universe of 1 to 20 symbols.")
-    frames = {}
-    for symbol, frame in training.items():
-        if not isinstance(symbol, str) or not symbol.strip() or len(symbol) > 32:
-            raise ValueError(
-                "Symbols must be non-empty strings of at most 32 characters."
-            )
-        clean = symbol.strip().upper()
-        if not re.fullmatch(r"[A-Z0-9.^=_-]{1,32}", clean):
-            raise ValueError(
-                "Symbols may contain uppercase letters, numbers, '.', '^', '=', '_', and '-'."
-            )
-        if clean in frames:
-            raise ValueError(f"Duplicate symbol after normalization: {clean}.")
-        if not isinstance(frame, pd.DataFrame) or not set(COLUMNS).issubset(
-            frame.columns
-        ):
-            raise ValueError(
-                f"{clean} needs Open, High, Low, Close, and Volume columns."
-            )
-        if not frame.columns.is_unique:
-            raise ValueError(f"{clean} has duplicate column names.")
-        if len(frame) < MIN_TRAINING_BARS:
-            raise ValueError(
-                f"{clean} needs at least {MIN_TRAINING_BARS} training bars."
-            )
-        if (
-            not frame.index.is_unique
-            or not frame.index.is_monotonic_increasing
-            or frame.index.hasnans
-        ):
-            raise ValueError(
-                f"{clean} needs a unique, increasing index without missing values."
-            )
-        values = frame.loc[:, list(COLUMNS)].to_numpy(dtype=float)
-        if (
-            not np.isfinite(values).all()
-            or (values[:, :4] <= 0).any()
-            or (values[:, 4] < 0).any()
-        ):
-            raise ValueError(
-                f"{clean} needs finite, positive prices and non-negative volume."
-            )
-        opening, high, low, close = values[:, :4].T
-        if (
-            (high < np.maximum(opening, close))
-            | (low > np.minimum(opening, close))
-            | (low > high)
-        ).any():
-            raise ValueError(f"{clean} has invalid OHLC ordering.")
-        frames[clean] = frame.loc[:, list(COLUMNS)].astype(float)
-
+    frames = validate_market(training)
     symbols = tuple(sorted(frames))
     reference = frames[symbols[0]].index
-    if any(not frames[symbol].index.equals(reference) for symbol in symbols):
-        raise ValueError("All symbols must have the same complete training calendar.")
     source_hash = hashlib.sha256(
         _json_bytes(
             {
@@ -369,9 +285,15 @@ def _validate_round(round_data):
     manifest = round_data.manifest
     if manifest.get("generator_version") not in (
         "synthetic-market-v1",
+        "synthetic-market-v2",
         GENERATOR_VERSION,
     ):
         raise ValueError("Unsupported synthetic generator version.")
+    if (
+        manifest["generator_version"] == GENERATOR_VERSION
+        and manifest.get("randomness") != RANDOMNESS_VERSION
+    ):
+        raise ValueError("Unsupported synthetic randomness version.")
     config = SyntheticConfig(**manifest["config"])
     symbols = manifest["symbols"]
     if not symbols or len(symbols) > 20 or symbols != sorted(set(symbols)):
@@ -450,9 +372,7 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
             np.linalg.cholesky(matrix) for matrix in rate_model["joint_covariances"]
         ]
     for path_index in range(config.paths):
-        rng = np.random.default_rng(
-            np.random.SeedSequence(seed, spawn_key=(path_index, 0))
-        )
+        rng = SecureRandom(seed, (path_index, 0))
         previous_close = np.full(assets, 100.0)
         previous_return = means[:assets] + means[assets:]
         if rate_model is not None:
@@ -503,9 +423,7 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
             )
 
         for asset in range(assets):
-            candle_rng = np.random.default_rng(
-                np.random.SeedSequence(seed, spawn_key=(path_index, 1, asset))
-            )
+            candle_rng = SecureRandom(seed, (path_index, 1, asset))
             candle = prices[path_index, asset]
             extensions = np.minimum(
                 np.exp(
@@ -521,9 +439,7 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
             candle[:, 2] = np.minimum(candle[:, 0], candle[:, 3]) * np.exp(
                 -extensions[:, 1]
             )
-            volume_rng = np.random.default_rng(
-                np.random.SeedSequence(seed, spawn_key=(path_index, 2, asset))
-            )
+            volume_rng = SecureRandom(seed, (path_index, 2, asset))
             # More active candles tend to have more volume; every volume is new.
             activity = (
                 np.abs(np.log(candle[:, 3] / candle[:, 0])) / scales[assets + asset]
@@ -543,6 +459,7 @@ def generate_round(model: MarketModel, seed: int, config=None) -> SyntheticRound
 
     manifest = {
         "generator_version": GENERATOR_VERSION,
+        "randomness": RANDOMNESS_VERSION,
         "symbols": list(model.symbols),
         "config": asdict(config),
         "training_sha256": model.training_sha256,

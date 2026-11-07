@@ -42,6 +42,14 @@ includes Python, installed strategy libraries, and the runner/launcher/bootstrap
 code. Upgrading any of them requires checking compatibility and starting a new
 round or restoring the previous runtime; it must not silently change old scores.
 Restart the service whenever code or packages change.
+The worker verifies the fingerprint again before opening each session and when
+queried for its runtime. A change on disk causes a retryable worker failure.
+Each final-path request includes the frozen round's expected fingerprint.
+
+Before binding its listener, the service launches a trusted policy probe through
+the actual sandbox. Startup fails if the probe can read a host canary, write in
+the guest, create a socket, inherit the worker credential, share the host's
+mount/process/network namespaces, or run without the expected memory and CPU limits.
 
 The client and worker negotiate incremental history updates. The guest receives
 the initial observation prefix and subsequent new rows, and reconstructs the
@@ -106,6 +114,17 @@ The worker must not receive `/app/data`, the final dataset, or web app secrets.
    competition if independent verification is desired; never reuse a revealed
    seed or final dataset for a new open round.
 
+Online practice is available during the open phase. The default two-session
+worker reserves one session for finals. Infrastructure failures return grading
+to the locked phase, preserve completed results, and leave interrupted entries
+pending. Publication requires every selected entry to have a completed result
+or a strategy error. A busy worker or broken connection cannot become a team's
+published strategy error.
+
+The engine and generator version changes in this audit require a newly prepared
+round. Existing published results remain available. To finish an older locked
+round, restore its pinned controller code and worker runtime before grading.
+
 ## Limits and threat model
 
 Each sandbox has a 1 GiB address-space limit, 30 CPU seconds, a 45-second total
@@ -113,6 +132,10 @@ lifetime, and a three-second response limit per bar. Startup has 15 seconds.
 The service admits two sandbox sessions and 16 HTTP request threads. Individual
 responses are capped at 256 KiB; persistent trader data at 100 KB; source at
 128 KB. Both normal and native-library code are subject to the OS policy.
+Practice admission is capped at one of those two sessions. Final sessions can
+use remaining capacity. HTTP connections are reused across steps, but full
+public-history runs still need deployment-specific latency profiling against
+the 45-second wall-clock budget.
 
 The guest starts with an empty root, read-only runtime mounts, private process,
 user, IPC, UTS, and network namespaces, no inherited environment, and a seccomp

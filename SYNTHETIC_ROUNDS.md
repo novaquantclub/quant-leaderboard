@@ -31,8 +31,9 @@ This is a model-based competition. It tests performance under the published
 generator assumptions, not a claim about actual future market returns. The
 model's relationships, tails, regime persistence, and volatility clustering
 should be checked on the club's actual training dataset before a round starts.
-The generator constants are public and versioned; only final random draws and
-the final seed are hidden. Independent synthetic paths do not remove model
+The generator constants are versioned in the organizer repository. The model
+should withstand participants learning its assumptions. Final random draws and
+the final seed stay private. Independent synthetic paths do not remove model
 misspecification or justify claims of real-world statistical significance.
 
 ## interest rate
@@ -43,7 +44,7 @@ receive its available history through `state.observations["interest rate"]`.
 Price and volume normalization applies to asset histories. Rates retain their
 published units, including zero or negative values when supplied.
 
-Generator v2 fits a persistent, bounded rate process and joint covariance matrices
+Since generator v2, the model fits a persistent, bounded rate process and joint covariance matrices
 for asset overnight returns, asset intraday returns, and rate innovations. The
 matrices are estimated separately below and above the public sample's median
 rate, using the previous observed rate for conditioning. Small groups use the
@@ -57,7 +58,25 @@ fresh rate histories, including warm-up, alongside the synthetic asset arrays.
 The rate hash and calibration data enter the dataset commitment. These are
 model-conditioned simulations. Policy timing, causal market responses, and
 historical revision vintages require further assumptions beyond this model.
-Saved v1 asset-only snapshots remain readable.
+Saved v1 asset-only and v2 joint-rate snapshots remain readable.
+
+## Private draws and public research
+
+Generator v3 uses domain-separated HMAC-SHA256 counter streams for market shocks,
+candles, and volume. The fresh round seed has 128 bits of entropy. A versioned
+stream label separates paths and asset components, and the manifest records the
+randomness version. NumPy's statistical generators are unsuitable for
+security-sensitive use. This change hardens the private draws. No practical
+recovery of the earlier generator's seed was demonstrated in our audit.
+[NumPy random documentation](https://numpy.org/doc/stable/reference/random/index.html),
+[Python HMAC documentation](https://docs.python.org/3/library/hmac.html)
+
+The member package contains public data validation and the execution engine.
+Synthetic preparation stays in the organizer's application. Anyone with
+repository access can inspect the generator's source and fitted model family.
+Teams can learn relationships and optimize against those assumptions. Protecting a final
+realization requires fresh secret draws, a frozen snapshot, isolated execution,
+and the blind submission lifecycle.
 
 ## Prepare one round
 
@@ -109,8 +128,10 @@ Loading verifies the price hash and market invariants. The stored array is
 read-only; each call to `path` returns independent DataFrames. Use this saved
 bundle for every submission and re-score, rather than downloading market data
 or regenerating the round. The evaluation ID combines its `dataset_id`
-with the execution engine version, numerical library versions, worker runtime
-fingerprint, and all scoring/execution settings.
+with the execution engine version, hashes of the engine and supporting modules,
+numerical library versions, worker runtime fingerprint, and all scoring/execution
+settings. Each final-path session checks the pinned worker fingerprint, followed
+by a final runtime check before the aggregate result is returned.
 Pass the recorded commitment as `expected_dataset_id` to `SyntheticRound.load`
 when verifying that both the manifest and the prices match the original round.
 

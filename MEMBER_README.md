@@ -21,6 +21,9 @@ and record which observations informed each development decision.
 - `engine_config.json` records the public pilot execution and scoring settings.
 - `nova-quant-member-starter.code-workspace` opens this folder in VS Code.
 
+Local support includes market schema validation and strategy execution. Private
+round preparation runs in the organizer's application.
+
 The competition assets are {{ASSETS}}. Each asset file contains the following
 columns on a shared trading calendar.
 
@@ -124,6 +127,11 @@ Use that state for observations and persistent strategy data. The hosted
 environment blocks network access and access to local research files. The
 submission consists of one self-contained Python file up to 128 KB. Supporting
 parameters can be included in that file.
+
+Online practice is available while submissions are open. Local practice remains
+available using this package. The hosted worker permits 1 GiB of address space,
+30 CPU seconds, a 45-second lifetime per path, and three seconds per strategy
+response. Startup has a 15-second allowance within that lifetime.
 
 ## Pilot execution and scoring
 
