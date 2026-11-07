@@ -3,11 +3,7 @@ import numpy as np
 
 class Trader:
     # Use only symbols present in the round's published training CSVs.
-    tickers = [
-        "SPY",
-        "QQQ",
-        "GLD",
-    ]  # Mandatory: declare the tickers you want to trade here
+    tickers = ("ATLAS", "BOREAL", "CIRRUS", "DUNE", "EMBER")
 
     def __init__(self):
         self.name = (
@@ -59,5 +55,5 @@ class Trader:
 
 if __name__ == "__main__":
     print(
-        "Run: python backtester.py sample_strategy.py --data training --trusted-local"
+        "Run: python backtester.py sample_strategy.py --data training --benchmark ATLAS --trusted-local"
     )

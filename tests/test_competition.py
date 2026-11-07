@@ -83,6 +83,22 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             Backtester().run_dataset(BadOrders(), training_fixture(130))
 
+    def test_competition_names_work_with_neutral_benchmark_metrics(self):
+        market = {"ATLAS": training_fixture(130)["SPY"]}
+
+        class NamedAsset(BuyHold):
+            tickers = ("ATLAS",)
+
+            def run(self, state):
+                return {"ATLAS": 1_000_000} if state.step == 0 else {}
+
+        result = Backtester(EngineConfig(benchmark="ATLAS")).run_dataset(
+            NamedAsset(), market
+        )
+        self.assertEqual(list(result["equity_df"].columns), ["Strategy", "Benchmark"])
+        self.assertAlmostEqual(result["sharpe"], result["benchmark_sharpe"])
+        self.assertFalse(any(name.startswith("spy_") for name in result))
+
     def test_long_only_and_read_only_signals(self):
         class Seller(BuyHold):
             tickers = ("SPY", "^SIGNAL")
@@ -252,7 +268,10 @@ class CompetitionTests(unittest.TestCase):
         with zipfile.ZipFile(
             io.BytesIO(self.store.training_zip(self.round_id))
         ) as archive:
-            self.assertEqual(set(archive.namelist()), {"SPY.csv", "QQQ.csv", "GLD.csv"})
+            self.assertEqual(
+                set(archive.namelist()), {"SPY.csv", "QQQ.csv", "GLD.csv", "README.md"}
+            )
+            self.assertTrue(archive.read("SPY.csv").startswith(b"Date,"))
         public = Path(self.store.round(self.round_id)["public_dir"]) / "SPY.csv"
         frame = pd.read_csv(public)
         frame.loc[0, "Volume"] += 1

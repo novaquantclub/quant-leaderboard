@@ -38,7 +38,8 @@ misspecification or justify claims of real-world statistical significance.
 ## Prepare one round
 
 Place the exact public training CSVs in `data/training/`, one file per asset,
-such as `SPY.csv`, `QQQ.csv`, and `GLD.csv`. Each file needs an ordered `Date` or
+such as `ATLAS.csv`, `BOREAL.csv`, `CIRRUS.csv`, `DUNE.csv`, and `EMBER.csv`.
+Each file needs an ordered `Date` or
 `Step` column first, then `Open,High,Low,Close,Volume`.
 
 ```powershell
@@ -73,8 +74,8 @@ the club wants independent reproduction.
 from synthetic_market import SyntheticRound
 
 round_data = SyntheticRound.load("data/rounds/final-round")
-prices = round_data.path(0, ["SPY", "QQQ"])
-# prices["SPY"] has integer steps -100 through 251.
+prices = round_data.path(0, ["ATLAS", "BOREAL"])
+# prices["ATLAS"] has integer steps -100 through 251.
 # Only the current history prefix may cross into a strategy worker.
 ```
 

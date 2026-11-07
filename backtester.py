@@ -13,7 +13,7 @@ import pandas as pd
 from strategy_runner import RemoteTrader, validate_orders
 from synthetic_market import COLUMNS, SyntheticRound, calibrate_market
 
-ENGINE_VERSION = "streamed-next-open-v2"
+ENGINE_VERSION = "streamed-next-open-v3"
 WARMUP_BARS = 100
 
 
@@ -176,7 +176,8 @@ class Backtester:
             pending, trader_data = validate_orders(
                 {"orders": orders, "trader_data": trader_data}, tickers
             )
-        result = pd.DataFrame(curve, columns=["Strategy", "SPY_Benchmark"])
+        benchmark_column = "SPY_Benchmark" if config.benchmark == "SPY" else "Benchmark"
+        result = pd.DataFrame(curve, columns=["Strategy", benchmark_column])
         result.index.name = "Trading Day"
         return {
             **self._score_equity(result),
@@ -201,7 +202,10 @@ class Backtester:
 
     def _score_equity(self, curve):
         strategy = self._calc_metrics(curve.Strategy)
-        benchmark = self._calc_metrics(curve.SPY_Benchmark)
+        benchmark_column = (
+            "SPY_Benchmark" if self.config.benchmark == "SPY" else "Benchmark"
+        )
+        benchmark = self._calc_metrics(curve[benchmark_column])
         covariance = np.cov(strategy["excess_returns"], benchmark["excess_returns"])
         beta = (
             float(covariance[0, 1] / covariance[1, 1])
@@ -216,14 +220,15 @@ class Backtester:
             * 252
             * 100
         )
+        benchmark_prefix = "spy" if self.config.benchmark == "SPY" else "benchmark"
         return {
             **{
                 key: value for key, value in strategy.items() if key != "excess_returns"
             },
-            "spy_sharpe": benchmark["sharpe"],
-            "spy_return_pct": benchmark["total_return_pct"],
-            "spy_max_dd_pct": benchmark["max_drawdown_pct"],
-            "spy_final_equity": benchmark["final_equity"],
+            f"{benchmark_prefix}_sharpe": benchmark["sharpe"],
+            f"{benchmark_prefix}_return_pct": benchmark["total_return_pct"],
+            f"{benchmark_prefix}_max_dd_pct": benchmark["max_drawdown_pct"],
+            f"{benchmark_prefix}_final_equity": benchmark["final_equity"],
             "alpha_pct": float(alpha),
             "beta": beta,
         }
@@ -283,13 +288,16 @@ def main():
     parser.add_argument("strategy_file")
     parser.add_argument("--data", default="data/training")
     parser.add_argument(
+        "--benchmark", default="SPY", help="Benchmark asset in the dataset."
+    )
+    parser.add_argument(
         "--trusted-local",
         action="store_true",
         help="Execute your own code locally without the hosted worker.",
     )
     args = parser.parse_args()
     market = load_training(args.data)
-    engine = Backtester()
+    engine = Backtester(EngineConfig(benchmark=args.benchmark))
     if args.trusted_local:
         result = engine.run_dataset(load_local_trader(args.strategy_file), market)
     else:

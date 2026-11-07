@@ -4,6 +4,7 @@ import hmac
 import io
 import json
 import os
+import re
 import sqlite3
 import zipfile
 from datetime import UTC, datetime
@@ -29,7 +30,7 @@ def uploaded_source(file):
     return content.decode("utf-8-sig")
 
 
-def sdk_zip():
+def sdk_zip(tickers=None, benchmark="ATLAS"):
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for name in (
@@ -38,7 +39,28 @@ def sdk_zip():
             "strategy_runner.py",
             "sample_strategy.py",
         ):
-            archive.writestr(name, Path(__file__).with_name(name).read_bytes())
+            content = Path(__file__).with_name(name).read_text(encoding="utf-8")
+            if name == "sample_strategy.py" and tickers is not None:
+                content = re.sub(
+                    r"(?m)^    tickers = .+$",
+                    f"    tickers = {tuple(tickers)!r}",
+                    content,
+                    count=1,
+                )
+                content = content.replace(
+                    "--benchmark ATLAS", f"--benchmark {benchmark}"
+                )
+            archive.writestr(name, content)
+        archive.writestr(
+            "README.md",
+            "# Nova Quant League strategy SDK\n\n"
+            "Research the published asset histories and discover their relationships. "
+            "The starter provides a basic moving-average example.\n\n"
+            "Install numpy, pandas and scipy in your local Python environment, "
+            "then extract the training CSVs into a training folder and run your own code.\n\n"
+            "```sh\npython backtester.py sample_strategy.py --data training "
+            f"--benchmark {benchmark} --trusted-local\n```\n",
+        )
     return output.getvalue()
 
 
@@ -130,8 +152,10 @@ def main():
                     if row["Team"] in chosen
                 }
                 if curves:
-                    curves["SPY benchmark"] = successful[0]["equity_curve"][
-                        "SPY_Benchmark"
+                    benchmark = json.loads(current["config"])["benchmark"]
+                    column = "SPY_Benchmark" if benchmark == "SPY" else "Benchmark"
+                    curves[f"{benchmark} benchmark"] = successful[0]["equity_curve"][
+                        column
                     ]
                     st.line_chart(pd.DataFrame(curves), height=350)
                     st.caption(
@@ -252,9 +276,11 @@ def main():
 
     with guide:
         st.subheader("Strategy SDK")
+        tickers = sorted(store.public_market(round_id)) if current else None
+        benchmark = json.loads(current["config"])["benchmark"] if current else "ATLAS"
         st.download_button(
             "Download SDK and starter strategy",
-            sdk_zip(),
+            sdk_zip(tickers, benchmark),
             "nova-quant-sdk.zip",
             "application/zip",
         )
@@ -267,11 +293,13 @@ def main():
 6. Online code runs without network, host files, or persistent disk access. Keep `trader_data` under 100 KB.
 7. Practice freely on public data, store your versions, and explicitly choose one final entry before the organizer locks the round.
 8. Finals use independent synthetic paths fitted to the public data. Scores remain hidden until the organizer publishes the closed round.
+9. Research the assets and discover their relationships using the published observations.
 
 Your team identity comes from your access token. `Trader.author` is descriptive and cannot select another team's leaderboard entry.
 """)
         st.code(
-            "python backtester.py sample_strategy.py --data training --trusted-local",
+            "python backtester.py sample_strategy.py --data training "
+            f"--benchmark {benchmark} --trusted-local",
             language="shell",
         )
         st.caption(
@@ -323,6 +351,7 @@ Your team identity comes from your access token. `Trader.author` is descriptive 
             training_dir = st.text_input(
                 "Public training CSV folder on this server", "data/training"
             )
+            benchmark = st.text_input("Benchmark competition asset", "ATLAS")
             paths = st.number_input(
                 "Independent final paths", min_value=10, max_value=100, value=30
             )
@@ -341,7 +370,10 @@ Your team identity comes from your access token. `Trader.author` is descriptive 
                 with st.spinner(
                     "Freezing the public training snapshot and generating final paths..."
                 ):
-                    config = EngineConfig(runtime_id=worker_runtime_id())
+                    config = EngineConfig(
+                        benchmark=benchmark.strip().upper(),
+                        runtime_id=worker_runtime_id(),
+                    )
                     store.create_round(
                         name,
                         training_dir,

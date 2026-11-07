@@ -175,7 +175,7 @@ class Competition:
         public_dir.mkdir(parents=True)
         for symbol, frame in training.items():
             frame.loc[:, list(COLUMNS)].to_csv(
-                public_dir / f"{symbol}.csv", index_label="Step"
+                public_dir / f"{symbol}.csv", index_label=frame.index.name or "Step"
             )
         model = calibrate_market(load_training(public_dir))
         seed = secrets.randbits(128)
@@ -213,10 +213,30 @@ class Competition:
 
     def training_zip(self, round_id):
         market = self.public_market(round_id)
+        config = EngineConfig(**json.loads(self.round(round_id)["config"]))
         output = io.BytesIO()
         with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
             for symbol, frame in market.items():
-                archive.writestr(f"{symbol}.csv", frame.to_csv(index_label="Step"))
+                archive.writestr(
+                    f"{symbol}.csv",
+                    frame.to_csv(index_label=frame.index.name or "Step"),
+                )
+            archive.writestr(
+                "README.md",
+                "# Nova Quant League training data\n\n"
+                f"Competition assets are {', '.join(sorted(market))}.\n\n"
+                "Each CSV has one daily observation per row on a shared calendar. "
+                "The first column is the observation date or step, followed by "
+                "Open, High, Low, Close and Volume. Prices use consistent corporate-action "
+                "adjustments. Volume records share counts.\n\n"
+                "Investigate asset behaviour and relationships using the supplied observations. "
+                "Teams develop their own signals and allocation rules.\n\n"
+                f"The warm-up contains {config.warmup_bars} bars. Strategy history uses integer "
+                "steps and normalized prices and volume. Orders execute at the next open. "
+                f"Costs are {config.commission_bps:g} basis points per trade. "
+                f"The comparison benchmark buys and holds {config.benchmark}.\n\n"
+                "Final evaluation uses independent synthetic paths calibrated from this dataset.\n",
+            )
         return output.getvalue()
 
     def submit(self, round_id, team_id, source, metadata):

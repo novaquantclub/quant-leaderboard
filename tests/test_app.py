@@ -1,7 +1,10 @@
+import ast
 import importlib.util
+import io
 import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +14,31 @@ from unittest.mock import patch
     "Streamlit UI checks run in the web app environment",
 )
 class AppTests(unittest.TestCase):
+    def test_downloaded_starter_uses_round_asset_names(self):
+        from app import sdk_zip
+
+        for names, benchmark in (
+            (["ATLAS", "BOREAL", "CIRRUS", "DUNE", "EMBER"], "ATLAS"),
+            (["SPY", "QQQ", "GLD"], "SPY"),
+        ):
+            with (
+                self.subTest(names=names),
+                zipfile.ZipFile(io.BytesIO(sdk_zip(names, benchmark))) as archive,
+            ):
+                source = archive.read("sample_strategy.py").decode()
+                trader = next(
+                    node
+                    for node in ast.parse(source).body
+                    if isinstance(node, ast.ClassDef)
+                )
+                tickers = next(
+                    node for node in trader.body if isinstance(node, ast.Assign)
+                )
+                self.assertEqual(list(ast.literal_eval(tickers.value)), names)
+                self.assertIn(
+                    f"--benchmark {benchmark}", archive.read("README.md").decode()
+                )
+
     def test_fresh_app_and_organizer_authentication(self):
         from streamlit.testing.v1 import AppTest
 

@@ -28,10 +28,10 @@ Start with `sample_strategy.py`:
 class Trader:
     name = "My strategy"
     author = "Your name"  # Descriptive; the login token determines the team.
-    tickers = ["SPY", "QQQ", "GLD"]  # Subset of the round's fixed universe.
+    tickers = ["ATLAS", "BOREAL", "CIRRUS", "DUNE", "EMBER"]
 
     def run(self, state):
-        return {"SPY": 10} if state.step == 0 else {}
+        return {"ATLAS": 10} if state.step == 0 else {}
 ```
 
 `run` receives `step`, `history`, `positions`, `cash`, `portfolio_value`, and
@@ -47,8 +47,8 @@ not guaranteed to reproduce just because the market snapshot is frozen.
 
 Orders fill at the next open with 10 bps costs. Positions are long-only; symbols
 containing `^` or `=` are signals and cannot be traded. Both portfolios start in
-cash at the first close. SPY buys at the following open, which is the first fill
-opportunity available to a strategy.
+cash at the first close. The selected benchmark asset buys at the following open,
+which is the first fill opportunity available to a strategy.
 
 ## Public data and local practice
 
@@ -60,14 +60,26 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Supply your own public CSVs or download a sample dataset once:
+Teams receive five neutrally named assets, ATLAS, BOREAL, CIRRUS, DUNE, and EMBER.
+Researching their behaviour and discovering relationships is part of the challenge.
+The public training period covers 2007 through 2025 with daily observations.
+
+Organizers can supply prepared CSVs or download them once. In PowerShell,
+`$sourceTickers` is the organizer's private five-symbol list.
 
 ```powershell
-python prepare_training.py data/training --start 2020-01-01 --end 2026-01-01 --tickers SPY QQQ GLD
+python prepare_training.py data/training --start 2007-01-01 --end 2026-01-01 --tickers $sourceTickers --asset-names ATLAS BOREAL CIRRUS DUNE EMBER
 ```
 
-Those dates are an example for **public training**, not hidden evaluation
-windows. Each `SYMBOL.csv` needs an ordered Date/Step index and
+The command randomly assigns the competition names and records the source mapping,
+download settings, and CSV hashes in the sibling `data/training.private.json`.
+Keep that organizer-only file separate from participant downloads. Files ending
+in `.private.json` are ignored by Git. Historical patterns can still identify a
+source asset, so the blind final uses newly generated paths.
+The exporter repairs adjusted-price ordering differences within eight float64
+rounding steps. Larger OHLC ordering errors fail validation.
+
+Each `SYMBOL.csv` needs an ordered Date/Step index and
 `Open,High,Low,Close,Volume`. Assets must share a complete calendar and have at
 least 120 bars, including the 100-bar warm-up. Downloads use the shared calendar
 intersection without backfilling. Never revise a published dataset in place.
@@ -76,8 +88,13 @@ Teams can download the training ZIP and SDK from the app, then run their own
 code locally without an online worker:
 
 ```powershell
-python backtester.py sample_strategy.py --data training --trusted-local
+python backtester.py sample_strategy.py --data training --benchmark ATLAS --trusted-local
 ```
+
+The organizer selects a benchmark by its competition name when opening a round.
+The downloaded starter uses that round's asset names, and the SDK and dataset
+README explain the schema and execution settings. Teams investigate the asset
+relationships themselves.
 
 `--trusted-local` executes the named script on the user's own machine. Use it
 only for code you trust. The web application has no corresponding fallback.
