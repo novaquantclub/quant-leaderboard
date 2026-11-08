@@ -16,10 +16,10 @@ Every strategy is evaluated against an SPY buy-and-hold benchmark using:
 - Beta to SPY
 - Equity curve and final portfolio value
 
-Official submissions are run across multiple historical, out-of-sample market
-windows. The windows are chained into one continuous equity curve, carrying the
-ending portfolio value from one regime into the next. Evaluation windows are
-configured by the organizer and are not exposed to competitors.
+Official submissions are scored across many seeded, random historical
+out-of-sample windows. Every strategy uses the same hidden windows, and the
+median result across those windows is used for ranking. The seed and window
+configuration are not exposed to competitors.
 
 The default simulation assumptions are:
 
@@ -96,7 +96,7 @@ The `state` object includes:
 
 Prices and timestamps are anonymized during official evaluation: prices are
 rebased to 100 at the first bar and dates are replaced with integer bar indices.
-This helps prevent strategies from identifying hidden evaluation regimes.
+This helps prevent strategies from identifying hidden evaluation periods.
 
 ## Test locally
 
@@ -147,13 +147,17 @@ The app supports these environment variables:
 | --- | --- | --- |
 | `CLUB_PASSWORD` | Password required for member submissions | `password` |
 | `ADMIN_PASSWORD` | Password for organizer controls | `password` |
-| `SECRET_OOS_WINDOWS` | Initial comma-separated `start:end` evaluation windows | Two example 2018 windows |
+| `MC_WINDOWS` | Number of hidden Monte Carlo windows | `40` |
+| `MC_WINDOW_DAYS` | Trading-day length of each hidden window | `252` |
+| `MC_POOL_START` | Earliest date eligible for window sampling | `2006-01-01` |
+| `MC_POOL_END` | Exclusive latest date for window sampling | `2026-01-01` |
+| `MC_SEED` | Shared seed used to select identical windows | `0` |
+| `MC_SCORE_QUANTILE` | Quantile used for official metrics (`0.5` is median) | `0.5` |
 | `COOLDOWN_HOURS` | Minimum hours between updates to the same member/strategy | `0` |
 | `DB_PATH` | SQLite database location | `data/leaderboard.db` |
 
-For any shared or deployed instance, set strong passwords and configure
-evaluation windows through environment variables or the Admin tab. The default
-passwords are intended only for local development.
+For any shared or deployed instance, set strong passwords and keep `MC_SEED`
+private. The default passwords are intended only for local development.
 
 ## Project structure
 
@@ -161,6 +165,7 @@ passwords are intended only for local development.
 | --- | --- |
 | [`app.py`](app.py) | Streamlit UI, submissions, leaderboard, and admin controls |
 | [`backtester.py`](backtester.py) | Data loading, simulation, metrics, and CLI |
+| [`mc_eval.py`](mc_eval.py) | Hidden-window sampling, Monte Carlo scoring, and outcome charts |
 | [`sample_strategy.py`](sample_strategy.py) | Starter moving-average strategy |
 | [`requirements.txt`](requirements.txt) | Python dependencies |
 | [`nixpacks.toml`](nixpacks.toml) | Deployment start command |

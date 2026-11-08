@@ -16,22 +16,6 @@ def is_read_only_symbol(symbol: str) -> bool:
     return any(marker in symbol for marker in READ_ONLY_SYMBOL_MARKERS)
 
 
-def chain_equity_curves(curves: List[pd.Series], initial_value: float) -> pd.Series:
-    """Concatenate per-regime paths while preserving each curve's first return."""
-    parts = []
-    level = float(initial_value)
-    for index, curve in enumerate(curves):
-        curve_with_start = pd.concat(
-            [pd.Series([initial_value]), curve.astype(float)], ignore_index=True
-        )
-        part = curve_with_start / float(curve_with_start.iloc[0]) * level
-        level = float(part.iloc[-1])
-        if index > 0:
-            part = part.iloc[1:]
-        parts.append(part.reset_index(drop=True))
-    return pd.concat(parts, ignore_index=True)
-
-
 @dataclass
 class TradingState:
     step: int  # Anonymized integer bar index (0, 1, 2, ...)
@@ -270,87 +254,6 @@ class Backtester:
             "equity_df": eq_df,
             "tickers": ", ".join(tickers),
         }
-
-    def run_multi_window(self, strategy_filepath: str, windows_str: str) -> Dict:
-        """
-        Evaluates a fresh Trader instance across multiple secret (start, end) regimes.
-        windows_str format: "2018-09-01:2019-04-01,2022-01-01:2022-10-01,2025-02-01:2026-10-01"
-
-        Regimes are stitched together sequentially: the ending equity of one
-        regime becomes the starting equity of the next, giving one continuous
-        portfolio path. All reported metrics are calculated from that combined
-        path rather than averaged per regime.
-        """
-        pairs = [w.strip().split(":") for w in windows_str.split(",") if ":" in w]
-        results = []
-        for start_d, end_d in pairs:
-            fresh_trader = load_trader_from_file(strategy_filepath)
-            res = self.run(fresh_trader, start_d.strip(), end_d.strip())
-            results.append(res)
-
-        # Stitch each regime's path onto the end of the previous one. The
-        # prepended baseline preserves each window's first trading-day return,
-        # while subsequent baselines are dropped to avoid duplicate seam bars.
-        strategy_curve = chain_equity_curves(
-            [res["equity_df"]["Strategy"] for res in results], self.initial_cash
-        )
-        spy_curve = chain_equity_curves(
-            [res["equity_df"]["SPY_Benchmark"] for res in results], self.initial_cash
-        )
-        absolute_equity = pd.DataFrame(
-            {"Strategy": strategy_curve, "SPY_Benchmark": spy_curve}
-        )
-        absolute_equity.index.name = "Trading Day"
-
-        # Score the concatenated curve exactly like a single backtest.
-        strat_m = self._calc_metrics(absolute_equity["Strategy"])
-        spy_m = self._calc_metrics(absolute_equity["SPY_Benchmark"])
-
-        cov_matrix = np.cov(strat_m["excess_returns"], spy_m["excess_returns"])
-        spy_var = cov_matrix[1, 1]
-        beta = float(cov_matrix[0, 1] / spy_var) if spy_var > 1e-12 else 0.0
-        daily_alpha = (
-            strat_m["excess_returns"].mean() - beta * spy_m["excess_returns"].mean()
-        )
-        alpha_annual_pct = float(daily_alpha * 252 * 100.0)
-
-        equity_curve_df = absolute_equity.copy()
-        equity_curve_df.index.name = "Trading Day"
-
-        return {
-            "sharpe": strat_m["sharpe"],
-            "spy_sharpe": spy_m["sharpe"],
-            "total_return_pct": strat_m["total_return_pct"],
-            "max_drawdown_pct": strat_m["max_drawdown_pct"],
-            "alpha_pct": alpha_annual_pct,
-            "beta": beta,
-            "tickers": results[0]["tickers"],
-            "regimes_tested": len(results),
-            "equity_curve_df": equity_curve_df,
-        }
-
-    def run_benchmark_multi_window(self, windows_str: str) -> Dict:
-        """Buy-and-hold benchmark metrics on the same concatenated regime path."""
-        pairs = [w.strip().split(":") for w in windows_str.split(",") if ":" in w]
-        curves = []
-        for start_d, end_d in pairs:
-            spy_df = self._download_single(
-                self.benchmark_ticker, start_d.strip(), end_d.strip()
-            )
-            spy_open = float(spy_df["Open"].iloc[0])
-            shares = self.initial_cash / (spy_open * (1.0 + self.commission_rate))
-            curves.append(shares * spy_df["Close"])
-
-        combined = chain_equity_curves(curves, self.initial_cash)
-        metrics = self._calc_metrics(combined)
-        return {
-            "sharpe": metrics["sharpe"],
-            "total_return_pct": metrics["total_return_pct"],
-            "max_drawdown_pct": metrics["max_drawdown_pct"],
-            "final_equity": metrics["final_equity"],
-            "regimes": len(pairs),
-        }
-
 
 def load_trader_from_file(filepath: str):
     spec = importlib.util.spec_from_file_location("user_strategy", filepath)

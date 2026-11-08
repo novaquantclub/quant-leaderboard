@@ -6,15 +6,12 @@ from datetime import datetime
 import streamlit as st
 import pandas as pd
 from backtester import Backtester, load_trader_from_file
+from mc_eval import from_env as monte_carlo_backtester, mc_fan_chart
 
 # --- Configuration & Environment Variables ---
+# Official scoring uses seeded random real sub-windows (Monte Carlo).
 CLUB_PASSWORD = os.getenv("CLUB_PASSWORD", "password")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "password")
-# Secret comma-separated regimes (Bull, Bear, Volatile) — NEVER shown in the UI
-SECRET_OOS_WINDOWS = os.getenv(
-    "SECRET_OOS_WINDOWS",
-    "2018-01-01:2018-12-31,2019-01-01:2019-12-31",
-)
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "0"))
 SUBMISSIONS_DIR = "data/submissions"
 DB_PATH = os.getenv("DB_PATH", "data/leaderboard.db")
@@ -23,23 +20,19 @@ os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 os.makedirs(SUBMISSIONS_DIR, exist_ok=True)
 
 
+def official_backtester():
+    """Evaluator used for official scoring (leaderboard, submissions, re-scoring)."""
+    return monte_carlo_backtester()
+
+
 @st.cache_data(ttl=3600)
-def get_oos_spy_benchmark(windows_str: str):
-    """Fetches and caches SPY buy-and-hold metrics on the concatenated regimes."""
-    bt = Backtester()
-    return bt.run_benchmark_multi_window(windows_str)
+def get_oos_spy_benchmark():
+    """Fetch and cache the Monte Carlo SPY benchmark metrics."""
+    return official_backtester().run_benchmark_multi_window()
 
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS app_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
         table_sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'leaderboard'"
         ).fetchone()
@@ -87,45 +80,12 @@ def init_db():
         columns = [row[1] for row in conn.execute("PRAGMA table_info(leaderboard)")]
         if "equity_curve" not in columns:
             conn.execute("ALTER TABLE leaderboard ADD COLUMN equity_curve TEXT")
-
-
-def get_evaluation_windows() -> str:
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT value FROM app_settings WHERE key = 'evaluation_windows'"
-        ).fetchone()
-    return row[0] if row else SECRET_OOS_WINDOWS
-
-
-def save_evaluation_windows(windows: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO app_settings (key, value)
-            VALUES ('evaluation_windows', ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            """,
-            (windows,),
-        )
-
-
-def validate_evaluation_windows(windows: str) -> str | None:
-    entries = [entry.strip() for entry in windows.split(",") if entry.strip()]
-    if not entries:
-        return "Please specify at least one evaluation window."
-
-    for entry in entries:
-        parts = [part.strip() for part in entry.split(":")]
-        if len(parts) != 2:
-            return f"Invalid window `{entry}`. Use YYYY-MM-DD:YYYY-MM-DD."
-        try:
-            start = datetime.strptime(parts[0], "%Y-%m-%d")
-            end = datetime.strptime(parts[1], "%Y-%m-%d")
-        except ValueError:
-            return f"Invalid window `{entry}`. Use YYYY-MM-DD:YYYY-MM-DD."
-        if start >= end:
-            return f"Invalid window `{entry}`. The end date must be after the start date."
-    return None
+        # Per-window Sharpe ratios (JSON list) for the Monte Carlo chart.
+        if "window_sharpes" not in columns:
+            conn.execute("ALTER TABLE leaderboard ADD COLUMN window_sharpes TEXT")
+        # Daily percentile bands of portfolio value (JSON) for the Monte Carlo fan chart.
+        if "mc_fan" not in columns:
+            conn.execute("ALTER TABLE leaderboard ADD COLUMN mc_fan TEXT")
 
 
 def serialize_equity_curve(curve_df: pd.DataFrame) -> str:
@@ -141,15 +101,19 @@ def serialize_equity_curve(curve_df: pd.DataFrame) -> str:
 def upsert_submission(member_name, strategy_name, res):
     excess_sharpe = res["sharpe"] - res["spy_sharpe"]
     equity_curve = serialize_equity_curve(res["equity_curve_df"])
+    window_sharpes = (
+        json.dumps(res["window_sharpes"]) if res.get("window_sharpes") else None
+    )
+    mc_fan = json.dumps(res["mc_fan"], separators=(",", ":")) if res.get("mc_fan") else None
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
             INSERT INTO leaderboard (
                 member_name, strategy_name, sharpe, excess_sharpe,
                 total_return_pct, alpha_pct, beta, max_drawdown_pct,
-                submitted_at, equity_curve
+                submitted_at, equity_curve, window_sharpes, mc_fan
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(member_name, strategy_name) DO UPDATE SET
                 strategy_name=excluded.strategy_name,
                 sharpe=excluded.sharpe,
@@ -159,7 +123,9 @@ def upsert_submission(member_name, strategy_name, res):
                 beta=excluded.beta,
                 max_drawdown_pct=excluded.max_drawdown_pct,
                 submitted_at=excluded.submitted_at,
-                equity_curve=excluded.equity_curve
+                equity_curve=excluded.equity_curve,
+                window_sharpes=excluded.window_sharpes,
+                mc_fan=excluded.mc_fan
             """,
             (
                 member_name,
@@ -172,6 +138,8 @@ def upsert_submission(member_name, strategy_name, res):
                 round(res["max_drawdown_pct"], 2),
                 datetime.now().strftime("%Y-%m-%d %H:%M UTC"),
                 equity_curve,
+                window_sharpes,
+                mc_fan,
             ),
         )
 
@@ -238,8 +206,35 @@ def get_equity_curves() -> dict:
     return curves
 
 
+def get_mc_data() -> dict:
+    """Load stored Monte Carlo data keyed by (member, strategy).
+
+    Each value is {"fan": percentile bands or None, "sharpes": per-window Sharpes or None}.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT member_name, strategy_name, mc_fan, window_sharpes
+            FROM leaderboard
+            WHERE mc_fan IS NOT NULL OR window_sharpes IS NOT NULL
+            """
+        ).fetchall()
+
+    out = {}
+    for member, strategy, fan_json, sharpes_json in rows:
+        entry = {"fan": None, "sharpes": None}
+        try:
+            entry["fan"] = json.loads(fan_json) if fan_json else None
+            entry["sharpes"] = (
+                [float(v) for v in json.loads(sharpes_json)] if sharpes_json else None
+            )
+        except (TypeError, ValueError):
+            continue
+        out[(member, strategy)] = entry
+    return out
+
+
 init_db()
-active_evaluation_windows = get_evaluation_windows()
 st.set_page_config(page_title="Leaderboard - Nova Quant Club ", layout="wide")
 st.title("Nova Quant Club — Strategy Leaderboard")
 
@@ -251,12 +246,14 @@ leaderboard_tab, backtester_tab, submission_tab, guide_tab, admin_tab = st.tabs(
 with leaderboard_tab:
     st.subheader("Official Rankings")
     st.caption(
-        "Evaluated across undisclosed multi-regime market windows | Ranked by Annualized Sharpe Ratio on the concatenated equity curve (10 bps fee/slippage, 4% RF rate)"
+        "Evaluated on many undisclosed random historical windows | Ranked by the median "
+        "annualized Sharpe ratio across windows (10 bps fee/slippage, 4% RF rate)"
     )
 
     # Pinned SPY Benchmark Reference Bar
+    spy_bench = None
     try:
-        spy_bench = get_oos_spy_benchmark(active_evaluation_windows)
+        spy_bench = get_oos_spy_benchmark()
         st.markdown(f"##### Benchmark Reference: `SPY` Buy-and-Hold")
         b1, b2, b3, b4 = st.columns(4)
         b1.metric("SPY Sharpe", f"{spy_bench['sharpe']:.3f}")
@@ -276,8 +273,8 @@ with leaderboard_tab:
         st.markdown("##### Equity Curve Comparison")
         st.caption(
             "Equity paths are precomputed when a strategy is scored and loaded from the "
-            "database. The hidden regimes are stitched together in order as one continuous "
-            "portfolio, starting at $100,000."
+            "database. Each curve is the single hidden window closest to the strategy's "
+            "median score, starting at $100,000."
         )
 
         options = {
@@ -328,6 +325,39 @@ with leaderboard_tab:
                 + ", ".join(missing_curves)
                 + ". Re-score from the Admin tab to populate it."
             )
+
+        # Monte Carlo view: spread of outcomes for one strategy across the hidden windows.
+        st.markdown("#### Monte Carlo: Range of Outcomes Across Hidden Windows")
+        labels = list(options)
+        mc_label = st.selectbox(
+            "Strategy",
+            labels,
+            index=labels.index(chosen_labels[0]) if chosen_labels else 0,
+            key="mc_strategy_select",
+        )
+        mc = get_mc_data().get(options[mc_label])
+        if not mc or not mc["fan"]:
+            st.info(
+                "No Monte Carlo data stored for this strategy yet. "
+                "Re-score from the Admin tab to populate it."
+            )
+        else:
+            st.caption(
+                "Each band is computed day by day across all hidden windows, every window "
+                "starting at $100,000. The solid line is the median, the dark band is the "
+                "middle 50% of windows, and the light band is the 5th to 95th percentile. "
+                "The dashed line is the SPY buy-and-hold median. A narrow fan means a "
+                "consistent strategy; a wide one means results depend on the period."
+            )
+            st.pyplot(mc_fan_chart(mc["fan"]))
+            if mc["sharpes"]:
+                q25, q50, q75 = (
+                    float(v) for v in pd.Series(mc["sharpes"]).quantile([0.25, 0.5, 0.75])
+                )
+                st.caption(
+                    f"Sharpe across {len(mc['sharpes'])} windows: median {q50:.2f}, "
+                    f"middle 50% between {q25:.2f} and {q75:.2f}."
+                )
 
 
 # --- TAB 2: WEB SANDBOX BACKTESTER ---
@@ -402,8 +432,9 @@ with backtester_tab:
 with submission_tab:
     st.subheader("Submit Strategy to the Leaderboard")
     st.caption(
-        f"Strategies are evaluated across multiple undisclosed historical market regimes "
-        f"with anonymized timestamps and base-100 prices. Submission cooldown: **{COOLDOWN_HOURS:g} hours**."
+        f"Strategies are evaluated across many undisclosed historical windows with "
+        f"anonymized timestamps and base-100 prices. Submission cooldown: "
+        f"**{COOLDOWN_HOURS:g} hours**."
     )
     submission_success = st.session_state.pop("submission_success", None)
     if submission_success:
@@ -471,7 +502,7 @@ with submission_tab:
 
                     if not cooldown_blocked:
                         with st.spinner(
-                            "Evaluating across secret multi-regime OOS windows vs SPY..."
+                            "Evaluating across hidden Monte Carlo windows vs SPY..."
                         ):
                             saved_path = os.path.join(
                                 SUBMISSIONS_DIR, f"{safe_name}.py"
@@ -479,15 +510,13 @@ with submission_tab:
                             with open(saved_path, "wb") as f:
                                 f.write(sub_file.getvalue())
 
-                            bt = Backtester(anonymize=True)
-                            res = bt.run_multi_window(
-                                saved_path, active_evaluation_windows
-                            )
+                            bt = official_backtester()
+                            res = bt.run_multi_window(saved_path)
 
                             upsert_submission(clean_member, clean_strat, res)
                             diff = res["sharpe"] - res["spy_sharpe"]
                             st.session_state["submission_success"] = (
-                                f"✅ Submitted across **{res['regimes_tested']}** hidden regimes! "
+                                f"✅ Submitted across **{res['windows_tested']}** hidden windows! "
                                 f"Sharpe: **{res['sharpe']:.3f}** ({diff:+.3f} vs SPY) | "
                                 f"Total Return: **{res['total_return_pct']:+.2f}%** | "
                                 f"Max Drawdown: **{res['max_drawdown_pct']:.2f}%** | "
@@ -543,8 +572,8 @@ with guide_tab:
     2. **Warm-up history:** At `step == 0`, `state.history` contains the prior 100 trading bars plus the current bar. In anonymized mode, history is indexed from `-100` through the current step, and evaluation bar `0` has an open price of 100. These bars are available for indicators but are not traded or scored.
     3. **Execution at Next Open:** Orders returned at bar $t$ are filled at the **Open price of bar $t+1$** with **10 bps (0.10%)** slippage/commission deducted.
     4. **Read-only macro symbols:** Symbols containing `^` or `=` can be used in `state.history` as signals, but non-zero orders for them are ignored.
-    5. **SPY Benchmark:** `SPY` Buy-and-Hold is initialized with $100,000 at the first day's Open (less the 10 bps fee) and held through the end of each evaluation window.
-    6. **Ranking Metric:** Annualized Daily Sharpe Ratio ($R_f = 4\\%$, $\\sqrt{252}$ scaling) computed on the **concatenated** Out-Of-Sample equity curve, alongside CAPM Alpha ($\\alpha$) and Beta ($\\beta$) relative to `SPY`. Regimes are chained in order, with each regime's ending equity carried into the next.
+    5. **SPY Benchmark:** `SPY` Buy-and-Hold is initialized with $100,000 at each window's first Open (less the 10 bps fee) and held through that window.
+    6. **Ranking Metric:** Annualized Daily Sharpe Ratio ($R_f = 4\\%$, $\\sqrt{252}$ scaling) is the median across hidden windows, alongside the median CAPM Alpha ($\\alpha$) and Beta ($\\beta$) relative to `SPY`.
     """)
     st.code(sample_code, language="python")
 
@@ -556,23 +585,6 @@ with admin_tab:
         st.info("Enter the admin password to manage submitted strategies.")
     else:
         st.success("Admin access granted.")
-        new_windows = st.text_input(
-            "Evaluation Window(s)",
-            value=active_evaluation_windows,
-            placeholder="YYYY-MM-DD:YYYY-MM-DD,YYYY-MM-DD:YYYY-MM-DD",
-            help="Use comma-separated start:end windows.",
-            key="admin_windows",
-        )
-
-        if st.button("Submit Changes", key="admin_save_windows"):
-            validation_error = validate_evaluation_windows(new_windows)
-            if validation_error:
-                st.error(validation_error)
-            else:
-                save_evaluation_windows(new_windows.strip())
-                active_evaluation_windows = new_windows.strip()
-                st.success("Evaluation windows updated.")
-
         st.markdown("#### Re-evaluate strategies")
         if st.button("Re-Score Entire Leaderboard", key="admin_rescore"):
             py_files = sorted(
@@ -583,7 +595,7 @@ with admin_tab:
             if not py_files:
                 st.info("No uploaded strategies found.")
             else:
-                bt = Backtester(anonymize=True)
+                bt = official_backtester()
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 success_count = 0
@@ -594,7 +606,7 @@ with admin_tab:
                     )
                     try:
                         member, strategy = get_strategy_metadata(fpath)
-                        result = bt.run_multi_window(fpath, active_evaluation_windows)
+                        result = bt.run_multi_window(fpath)
                         upsert_submission(member, strategy, result)
                         success_count += 1
                     except Exception as e:
